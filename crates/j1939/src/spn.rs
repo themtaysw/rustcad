@@ -1,11 +1,13 @@
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Width {
+    One,
     Two,
 }
 
 impl Width {
     fn bytes(self) -> usize {
         match self {
+            Width::One => 1,
             Width::Two => 2,
         }
     }
@@ -13,6 +15,7 @@ impl Width {
     /// Highest valid raw value. Above it are reserved, "error" and "not available" (J1939-71).
     fn max_valid(self) -> u32 {
         match self {
+            Width::One => 0xFA,
             Width::Two => 0xFAFF,
         }
     }
@@ -96,6 +99,21 @@ mod tests {
             data[1..3].copy_from_slice(&raw.to_le_bytes());
             let expected = (raw <= 0xFAFF).then(|| f64::from(raw) * 0.5 - 10.0);
             assert_eq!(TWO_BYTES.decode(&data), expected, "raw = {raw:#06X}");
+        }
+    }
+
+    #[test]
+    fn max_valid_per_width() {
+        for (width, max) in [(Width::One, 0xFA), (Width::Two, 0xFAFF)] {
+            let spn = Spn {
+                byte: 1,
+                width,
+                resolution: 1.0,
+                offset: 0.0,
+            };
+            let mut data = [0xFF; 8];
+            spn.encode(Some(f64::MAX), &mut data);
+            assert_eq!(spn.decode(&data), Some(f64::from(max)));
         }
     }
 

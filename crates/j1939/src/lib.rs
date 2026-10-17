@@ -7,4 +7,4 @@ mod pgn;
 mod spn;
 
 pub use id::CanId;
-pub use pgn::Eec1;
+pub use pgn::{Eec1, Et1};

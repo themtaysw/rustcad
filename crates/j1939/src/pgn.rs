@@ -31,6 +31,35 @@ impl Eec1 {
     }
 }
 
+/// Engine Temperature 1.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Et1 {
+    pub coolant_temp_c: Option<f64>,
+}
+
+impl Et1 {
+    pub const PGN: u32 = 65262;
+
+    const COOLANT_TEMP: Spn = Spn {
+        byte: 1,
+        width: Width::One,
+        resolution: 1.0,
+        offset: -40.0,
+    };
+
+    pub fn decode(data: &[u8; 8]) -> Self {
+        Self {
+            coolant_temp_c: Self::COOLANT_TEMP.decode(data),
+        }
+    }
+
+    pub fn encode(&self) -> [u8; 8] {
+        let mut data = NOT_AVAILABLE;
+        Self::COOLANT_TEMP.encode(self.coolant_temp_c, &mut data);
+        data
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +121,42 @@ mod tests {
                 rpm,
                 0.125 / 2.0,
             );
+        }
+    }
+
+    #[test]
+    fn et1_pgn_matches_spec_hex() {
+        assert_eq!(Et1::PGN, 0xFEEE);
+    }
+
+    #[test]
+    fn et1_coolant_temp() {
+        let data = [0x7D, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let msg = Et1::decode(&data);
+        assert_eq!(msg.coolant_temp_c, Some(85.0));
+        assert_eq!(msg.encode(), data);
+    }
+
+    #[test]
+    fn et1_offset_and_limits() {
+        assert_eq!(Et1::decode(&[0x00; 8]).coolant_temp_c, Some(-40.0));
+        assert_eq!(Et1::decode(&[0xFA; 8]).coolant_temp_c, Some(210.0));
+        assert_eq!(Et1::decode(&[0xFE; 8]).coolant_temp_c, None);
+    }
+
+    #[test]
+    fn et1_not_available() {
+        assert_eq!(Et1::decode(&NOT_AVAILABLE), Et1::default());
+        assert_eq!(Et1::default().encode(), NOT_AVAILABLE);
+    }
+
+    #[test]
+    fn et1_round_trip_within_resolution() {
+        for temp in [-40.0, -5.4, 20.0, 89.6, 210.0] {
+            let msg = Et1 {
+                coolant_temp_c: Some(temp),
+            };
+            assert_close(Et1::decode(&msg.encode()).coolant_temp_c, temp, 0.5);
         }
     }
 }
