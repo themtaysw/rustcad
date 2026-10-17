@@ -118,6 +118,43 @@ impl Ccvs {
     }
 }
 
+/// Vehicle Position.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct VehiclePosition {
+    pub latitude_deg: Option<f64>,
+    pub longitude_deg: Option<f64>,
+}
+
+impl VehiclePosition {
+    pub const PGN: u32 = 65267;
+
+    const LATITUDE: Spn = Spn {
+        byte: 1,
+        width: Width::Four,
+        resolution: 1e-7,
+        offset: -210.0,
+    };
+
+    const LONGITUDE: Spn = Spn {
+        byte: 5,
+        ..Self::LATITUDE
+    };
+
+    pub fn decode(data: &[u8; 8]) -> Self {
+        Self {
+            latitude_deg: Self::LATITUDE.decode(data),
+            longitude_deg: Self::LONGITUDE.decode(data),
+        }
+    }
+
+    pub fn encode(&self) -> [u8; 8] {
+        let mut data = NOT_AVAILABLE;
+        Self::LATITUDE.encode(self.latitude_deg, &mut data);
+        Self::LONGITUDE.encode(self.longitude_deg, &mut data);
+        data
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +315,53 @@ mod tests {
                 1.0 / 512.0,
             );
         }
+    }
+
+    #[test]
+    fn vehicle_position_pgn_matches_spec_hex() {
+        assert_eq!(VehiclePosition::PGN, 0xFEF3);
+    }
+
+    #[test]
+    fn vehicle_position_near_prostejov() {
+        let data = [0x18, 0x45, 0xA8, 0x9A, 0xB0, 0x82, 0x5E, 0x87];
+        let msg = VehiclePosition::decode(&data);
+        assert_close(msg.latitude_deg, 49.4719, 1e-9);
+        assert_close(msg.longitude_deg, 17.1118, 1e-9);
+        assert_eq!(msg.encode(), data);
+    }
+
+    #[test]
+    fn vehicle_position_negative_coordinates() {
+        let msg = VehiclePosition {
+            latitude_deg: Some(-33.8688),
+            longitude_deg: Some(-151.2093),
+        };
+        let decoded = VehiclePosition::decode(&msg.encode());
+        assert_close(decoded.latitude_deg, -33.8688, 0.5e-7);
+        assert_close(decoded.longitude_deg, -151.2093, 0.5e-7);
+    }
+
+    #[test]
+    fn vehicle_position_partially_available() {
+        let msg = VehiclePosition {
+            latitude_deg: Some(49.4719),
+            longitude_deg: None,
+        };
+        let data = msg.encode();
+        assert_eq!(&data[4..], &[0xFF; 4]);
+
+        let decoded = VehiclePosition::decode(&data);
+        assert_close(decoded.latitude_deg, 49.4719, 0.5e-7);
+        assert_eq!(decoded.longitude_deg, None);
+    }
+
+    #[test]
+    fn vehicle_position_not_available() {
+        assert_eq!(
+            VehiclePosition::decode(&NOT_AVAILABLE),
+            VehiclePosition::default()
+        );
+        assert_eq!(VehiclePosition::default().encode(), NOT_AVAILABLE);
     }
 }

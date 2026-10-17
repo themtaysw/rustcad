@@ -2,6 +2,7 @@
 pub(crate) enum Width {
     One,
     Two,
+    Four,
 }
 
 impl Width {
@@ -9,6 +10,7 @@ impl Width {
         match self {
             Width::One => 1,
             Width::Two => 2,
+            Width::Four => 4,
         }
     }
 
@@ -17,6 +19,7 @@ impl Width {
         match self {
             Width::One => 0xFA,
             Width::Two => 0xFAFF,
+            Width::Four => 0xFAFF_FFFF,
         }
     }
 }
@@ -104,7 +107,12 @@ mod tests {
 
     #[test]
     fn max_valid_per_width() {
-        for (width, max) in [(Width::One, 0xFA), (Width::Two, 0xFAFF)] {
+        let cases: [(Width, u32); 3] = [
+            (Width::One, 0xFA),
+            (Width::Two, 0xFAFF),
+            (Width::Four, 0xFAFF_FFFF),
+        ];
+        for (width, max) in cases {
             let spn = Spn {
                 byte: 1,
                 width,
