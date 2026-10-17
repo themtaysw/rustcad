@@ -1,14 +1,7 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! SAE J1939 helpers: 29-bit CAN ID parsing and decoding/encoding of a few PGNs.
+//!
+//! Pure library, no IO.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod id;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use id::CanId;
