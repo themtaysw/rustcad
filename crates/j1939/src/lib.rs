@@ -3,8 +3,10 @@
 //! Pure library, no IO.
 
 mod id;
+mod message;
 mod pgn;
 mod spn;
 
 pub use id::CanId;
+pub use message::{DecodeError, Message, decode};
 pub use pgn::{Ccvs, Eec1, Et1, Lfe, VehiclePosition};
