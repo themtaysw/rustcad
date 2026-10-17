@@ -1,4 +1,5 @@
 const PDU2_MIN_PF: u32 = 240;
+const GLOBAL_ADDRESS: u8 = 0xFF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanId {
@@ -30,6 +31,22 @@ impl CanId {
             source_address,
             destination_address,
         }
+    }
+
+    /// Builds the 29-bit CAN ID. A PDU1 message without a destination goes to the global address.
+    pub fn to_raw(&self) -> u32 {
+        let pgn = self.pgn & 0x3_FFFF;
+        let pf = (pgn >> 8) & 0xFF;
+        let ps = if pf >= PDU2_MIN_PF {
+            pgn & 0xFF
+        } else {
+            u32::from(self.destination_address.unwrap_or(GLOBAL_ADDRESS))
+        };
+
+        (u32::from(self.priority & 0x7) << 26)
+            | ((pgn & 0x3_FF00) << 8)
+            | (ps << 8)
+            | u32::from(self.source_address)
     }
 }
 
@@ -88,5 +105,25 @@ mod tests {
             CanId::from_raw(0xE000_0000 | 0x0CF0_0400),
             CanId::from_raw(0x0CF0_0400)
         );
+    }
+
+    #[test]
+    fn raw_round_trip() {
+        for raw in [
+            0x0CF0_0400,
+            0x18FE_EE00,
+            0x18EA_17F9,
+            0x18EF_2000,
+            0x18F0_2000,
+            0x19FE_EE00,
+            0x1CFE_F3AB,
+        ] {
+            assert_eq!(CanId::from_raw(raw).to_raw(), raw, "raw = {raw:#010X}");
+        }
+    }
+
+    #[test]
+    fn pdu1_without_destination_goes_to_global_address() {
+        assert_eq!(id(6, 0xEA00, 0xF9, None).to_raw(), 0x18EA_FFF9);
     }
 }
