@@ -89,6 +89,35 @@ impl Lfe {
     }
 }
 
+/// Cruise Control / Vehicle Speed.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Ccvs {
+    pub wheel_speed_kmh: Option<f64>,
+}
+
+impl Ccvs {
+    pub const PGN: u32 = 65265;
+
+    const WHEEL_SPEED: Spn = Spn {
+        byte: 2,
+        width: Width::Two,
+        resolution: 1.0 / 256.0,
+        offset: 0.0,
+    };
+
+    pub fn decode(data: &[u8; 8]) -> Self {
+        Self {
+            wheel_speed_kmh: Self::WHEEL_SPEED.decode(data),
+        }
+    }
+
+    pub fn encode(&self) -> [u8; 8] {
+        let mut data = NOT_AVAILABLE;
+        Self::WHEEL_SPEED.encode(self.wheel_speed_kmh, &mut data);
+        data
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +244,39 @@ mod tests {
                 fuel_rate_lph: Some(rate),
             };
             assert_close(Lfe::decode(&msg.encode()).fuel_rate_lph, rate, 0.05 / 2.0);
+        }
+    }
+
+    #[test]
+    fn ccvs_pgn_matches_spec_hex() {
+        assert_eq!(Ccvs::PGN, 0xFEF1);
+    }
+
+    #[test]
+    fn ccvs_wheel_speed() {
+        let data = [0xFF, 0x80, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let msg = Ccvs::decode(&data);
+        assert_eq!(msg.wheel_speed_kmh, Some(8.5));
+        assert_eq!(msg.encode(), data);
+    }
+
+    #[test]
+    fn ccvs_not_available() {
+        assert_eq!(Ccvs::decode(&NOT_AVAILABLE), Ccvs::default());
+        assert_eq!(Ccvs::default().encode(), NOT_AVAILABLE);
+    }
+
+    #[test]
+    fn ccvs_round_trip_within_resolution() {
+        for speed in [0.0, 0.3, 7.77, 12.0, 250.996] {
+            let msg = Ccvs {
+                wheel_speed_kmh: Some(speed),
+            };
+            assert_close(
+                Ccvs::decode(&msg.encode()).wheel_speed_kmh,
+                speed,
+                1.0 / 512.0,
+            );
         }
     }
 }
