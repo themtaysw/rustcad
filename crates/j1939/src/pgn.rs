@@ -60,6 +60,35 @@ impl Et1 {
     }
 }
 
+/// Fuel Economy (Liquid).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Lfe {
+    pub fuel_rate_lph: Option<f64>,
+}
+
+impl Lfe {
+    pub const PGN: u32 = 65266;
+
+    const FUEL_RATE: Spn = Spn {
+        byte: 1,
+        width: Width::Two,
+        resolution: 0.05,
+        offset: 0.0,
+    };
+
+    pub fn decode(data: &[u8; 8]) -> Self {
+        Self {
+            fuel_rate_lph: Self::FUEL_RATE.decode(data),
+        }
+    }
+
+    pub fn encode(&self) -> [u8; 8] {
+        let mut data = NOT_AVAILABLE;
+        Self::FUEL_RATE.encode(self.fuel_rate_lph, &mut data);
+        data
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +186,35 @@ mod tests {
                 coolant_temp_c: Some(temp),
             };
             assert_close(Et1::decode(&msg.encode()).coolant_temp_c, temp, 0.5);
+        }
+    }
+
+    #[test]
+    fn lfe_pgn_matches_spec_hex() {
+        assert_eq!(Lfe::PGN, 0xFEF2);
+    }
+
+    #[test]
+    fn lfe_fuel_rate() {
+        let data = [0xF7, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let msg = Lfe::decode(&data);
+        assert_close(msg.fuel_rate_lph, 12.35, 1e-9);
+        assert_eq!(msg.encode(), data);
+    }
+
+    #[test]
+    fn lfe_not_available() {
+        assert_eq!(Lfe::decode(&NOT_AVAILABLE), Lfe::default());
+        assert_eq!(Lfe::default().encode(), NOT_AVAILABLE);
+    }
+
+    #[test]
+    fn lfe_round_trip_within_resolution() {
+        for rate in [0.0, 3.21, 12.35, 47.99, 3212.75] {
+            let msg = Lfe {
+                fuel_rate_lph: Some(rate),
+            };
+            assert_close(Lfe::decode(&msg.encode()).fuel_rate_lph, rate, 0.05 / 2.0);
         }
     }
 }
