@@ -3,5 +3,8 @@
 //! Pure library, no IO.
 
 mod id;
+mod pgn;
+mod spn;
 
 pub use id::CanId;
+pub use pgn::Eec1;
