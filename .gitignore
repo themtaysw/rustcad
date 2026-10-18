@@ -6,3 +6,8 @@ plan.md
 
 # macOS
 .DS_Store
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/

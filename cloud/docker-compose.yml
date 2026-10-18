@@ -1,0 +1,33 @@
+# Project name is fixed so nothing collides with other compose projects on the same engine.
+name: rustcad
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: telemetry
+      POSTGRES_PASSWORD: telemetry
+      POSTGRES_DB: telemetry
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telemetry -d telemetry"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  receiver:
+    build: ./receiver
+    environment:
+      DATABASE_URL: postgresql://telemetry:telemetry@postgres:5432/telemetry
+      RECEIVER_TOKEN: ${RECEIVER_TOKEN:-dev-token}
+    ports:
+      - "127.0.0.1:18000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
