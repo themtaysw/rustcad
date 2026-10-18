@@ -1,0 +1,19 @@
+[package]
+name = "edge-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+j1939 = { path = "../j1939" }
+thiserror.workspace = true
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socketcan = { version = "3", features = ["tokio"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
