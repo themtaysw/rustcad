@@ -5,10 +5,16 @@ edition.workspace = true
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+humantime = "2"
 j1939 = { path = "../j1939" }
+rand = "0.9"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
 thiserror.workspace = true
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -16,4 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 socketcan = { version = "3", features = ["tokio"] }
 
 [dev-dependencies]
+serde_json = "1"
+tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+wiremock = "0.6"

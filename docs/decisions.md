@@ -125,3 +125,50 @@ table pair; a real service would use a migration tool (Alembic, sqitch) instead.
 to 127.0.0.1:18000, so it can run next to other compose projects without port or volume
 clashes. Tests use a separate `telemetry_test` database on the same server and never touch
 dev data.
+
+## edge-agent: aggregation by reading time, rpm min/max as extra signals
+Readings are bucketed by the second of their own timestamp, not by wall-clock arrival, so a
+replay produces the same samples as the live run. Every signal keeps its last value per second.
+Engine speed also emits `engine_speed_rpm_min` and `engine_speed_rpm_max` as separate signals,
+which fits the receiver's `(signal, value)` schema without changing it. A bucket closes when a
+reading for another second arrives (in either direction, so a clock jump never stalls it),
+after 2 s without input, or when input ends.
+
+## edge-agent: outbox rows are deleted on ack, `seq` uses AUTOINCREMENT
+Every row in the outbox is unsent, so "mark as sent" is `DELETE WHERE seq <= last_acked`.
+A plain `INTEGER PRIMARY KEY` would hand out the same number again after the newest rows are
+deleted; `AUTOINCREMENT` keeps the high-water mark in `sqlite_sequence`, so `seq` survives
+restarts and is never reused. The restart test checks exactly that.
+
+## edge-agent: SQLite in WAL mode with `synchronous=FULL`
+A tractor is switched off with the key, without a shutdown. FULL fsyncs every commit, so an
+acknowledged write survives power loss. The cost is one fsync per append (about once per
+second at our rate), which is nothing. WAL lets reads proceed while a write is in progress.
+
+## edge-agent: one connection behind `Arc<Mutex<_>>`, calls in `spawn_blocking`
+The writer and the uplink share one `rusqlite::Connection`. It is `Send` but not `Sync`, so a
+`Mutex` serializes access and `Arc` gives both tasks ownership. Every call runs in
+`spawn_blocking` so a slow fsync never blocks the async worker threads. Two connections would
+allow more parallelism but make the cap and depth bookkeeping racy.
+
+## edge-agent: outbox cap drops the oldest records
+When the outbox exceeds its cap, the oldest rows are deleted and `dropped_records` in a `meta`
+table is incremented in the same transaction. The next successful batch reports the counter
+and the ack subtracts exactly the reported amount, so drops that happen while a batch is in
+flight are not lost. Dropping oldest keeps the most recent state, which is what an operator
+looks at first. If a batch in flight gets trimmed, those records are both delivered and counted
+as dropped; the counter can over-report, never under-report.
+
+## edge-agent: uplink retries forever, ack only after 2xx
+Network errors, timeouts and 5xx are retried with exponential backoff (500 ms doubling to 60 s)
+with equal jitter, so a fleet that lost coverage together does not retry in lockstep. 4xx are
+retried too, at error level: a wrong token is a config problem, and dropping data would not
+fix it. A batch id is the seq range (`first-last`), so a resend after a lost response has
+the same id and the receiver does not count its `dropped_records` twice.
+
+## edge-agent: shutdown never aborts an upload in flight
+Shutdown stops the reader; every stage then drains in order, so all readings reach the
+outbox. The uplink stops waiting and backing off, but lets a running request finish, then makes
+a final attempt bounded by `final_flush_timeout`. An early version cancelled the request
+instead; the receiver had already stored the batch, and the restart test caught it being sent
+again in full.

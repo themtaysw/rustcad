@@ -174,7 +174,7 @@ mod tests {
     fn accepts_short_frames_and_trailing_newline() {
         let frame = parse_line("(1700000000.000001) can0 18FEEE00#7d\n").unwrap();
         assert_eq!(frame.data, vec![0x7D]);
-        assert_eq!(parse_line("(1.5) can0 18FEEE00#").unwrap().data, vec![]);
+        assert!(parse_line("(1.5) can0 18FEEE00#").unwrap().data.is_empty());
         assert_eq!(
             parse_line("(1.5) can0 18FEEE00#").unwrap().timestamp,
             at(1, 500_000)

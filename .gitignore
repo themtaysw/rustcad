@@ -11,3 +11,6 @@ plan.md
 .venv/
 __pycache__/
 .pytest_cache/
+
+# Local edge-agent outbox (default --outbox-path)
+edge-outbox.db*

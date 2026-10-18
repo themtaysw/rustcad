@@ -1,57 +1,110 @@
-use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use j1939::DecodeError;
-use tokio::sync::mpsc;
-use tokio::time::MissedTickBehavior;
-use tracing::{debug, info, warn};
+use thiserror::Error;
+use tokio::sync::{Notify, mpsc};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, warn};
 
-use crate::decode::{DecodeStats, Reading, Signal, decode_frame};
+use crate::aggregate::{Aggregator, Sample};
+use crate::decode::{DecodeStats, Reading, decode_frame};
 use crate::frame::Frame;
+use crate::outbox::{Outbox, OutboxError, OutboxHandle};
 use crate::source::FrameSource;
+use crate::uplink::{Uplink, UplinkConfig, UplinkStats};
 
 const CHANNEL_CAPACITY: usize = 1024;
-const LOG_EVERY: Duration = Duration::from_secs(1);
+/// Close the current aggregation bucket if no reading arrives for this long (bus went quiet).
+const IDLE_FLUSH: Duration = Duration::from_secs(2);
+/// Upper bound of samples written to SQLite in one transaction.
+const WRITE_CHUNK: usize = 512;
+
+#[derive(Debug, Error)]
+pub enum PipelineError {
+    #[error("reading frames failed: {0}")]
+    Source(#[from] io::Error),
+    #[error(transparent)]
+    Outbox(#[from] OutboxError),
+    #[error("cannot create HTTP client: {0}")]
+    Http(#[from] reqwest::Error),
+}
 
 #[derive(Debug)]
 pub struct Summary {
     pub frames_read: u64,
-    pub stats: DecodeStats,
-    pub latest: BTreeMap<Signal, f64>,
+    pub decode: DecodeStats,
+    pub samples_written: u64,
+    pub uplink: UplinkStats,
+    pub outbox_depth: u64,
 }
 
-/// Runs reader -> decoder -> logger as three tasks connected by bounded channels.
-/// Returns when the source is exhausted and every stage has drained its input.
-pub async fn run<S>(source: S) -> io::Result<Summary>
+/// Runs reader -> decoder -> aggregator -> outbox writer, plus the uplink task.
+///
+/// Stops when the source is exhausted or `shutdown` is cancelled. Either way every stage
+/// drains its input in order, so all readings end up in the outbox, and then the uplink
+/// makes a final attempt to upload what is left.
+pub async fn run<S>(
+    source: S,
+    outbox: Outbox,
+    config: UplinkConfig,
+    shutdown: CancellationToken,
+) -> Result<Summary, PipelineError>
 where
     S: FrameSource + Send + 'static,
 {
+    let outbox = OutboxHandle::new(outbox);
+    let work_waiting = Arc::new(Notify::new());
+    let batch_size = config.batch_size;
+    let uplink = Uplink::new(config, outbox.clone(), Arc::clone(&work_waiting))?;
+    let uplink_shutdown = CancellationToken::new();
+
     let (frame_tx, frame_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (reading_tx, reading_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let (sample_tx, sample_rx) = mpsc::channel(CHANNEL_CAPACITY);
 
-    let reader = tokio::spawn(read_frames(source, frame_tx));
+    let reader = tokio::spawn(read_frames(source, frame_tx, shutdown));
     let decoder = tokio::spawn(decode_frames(frame_rx, reading_tx));
-    let logger = tokio::spawn(log_readings(reading_rx, LOG_EVERY));
+    let aggregator = tokio::spawn(aggregate(reading_rx, sample_tx, IDLE_FLUSH));
+    let writer = tokio::spawn(write_samples(
+        sample_rx,
+        outbox.clone(),
+        work_waiting,
+        batch_size,
+    ));
+    let uplink = tokio::spawn(uplink.run(uplink_shutdown.clone()));
 
-    // A JoinError here means a task panicked, which is a bug, so it is not turned into an io::Error.
-    let frames_read = reader.await.expect("reader task panicked")?;
-    let stats = decoder.await.expect("decoder task panicked");
-    let latest = logger.await.expect("logger task panicked");
+    // A JoinError means a task panicked, which is a bug, so it is not turned into a PipelineError.
+    let frames_read = reader.await.expect("reader task panicked");
+    let decode = decoder.await.expect("decoder task panicked");
+    aggregator.await.expect("aggregator task panicked");
+    let samples_written = writer.await.expect("writer task panicked");
+    // Everything that will ever reach the outbox is there now.
+    uplink_shutdown.cancel();
+    let uplink = uplink.await.expect("uplink task panicked");
 
     Ok(Summary {
-        frames_read,
-        stats,
-        latest,
+        frames_read: frames_read?,
+        decode,
+        samples_written: samples_written?,
+        uplink: uplink?,
+        outbox_depth: outbox.depth().await,
     })
 }
 
 pub async fn read_frames<S: FrameSource>(
     mut source: S,
     tx: mpsc::Sender<Frame>,
+    shutdown: CancellationToken,
 ) -> io::Result<u64> {
     let mut count = 0;
-    while let Some(frame) = source.next_frame().await? {
+    loop {
+        let frame = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            frame = source.next_frame() => frame?,
+        };
+        let Some(frame) = frame else { break };
         if tx.send(frame).await.is_err() {
             break;
         }
@@ -85,95 +138,100 @@ pub async fn decode_frames(
     stats
 }
 
-/// Logs every reading at debug level and the latest value of each signal once per `every`.
-/// This is the end of the pipeline until the aggregator and outbox exist.
-pub async fn log_readings(
+pub async fn aggregate(
     mut rx: mpsc::Receiver<Reading>,
-    every: Duration,
-) -> BTreeMap<Signal, f64> {
-    let mut latest = BTreeMap::new();
-    let mut ticker = tokio::time::interval(every);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    ticker.tick().await;
-
+    tx: mpsc::Sender<Sample>,
+    idle_flush: Duration,
+) {
+    let mut aggregator = Aggregator::default();
     loop {
-        tokio::select! {
-            reading = rx.recv() => {
-                let Some(reading) = reading else { break };
-                debug!(
-                    signal = %reading.signal,
-                    value = reading.value,
-                    source_address = reading.source_address,
-                    "reading"
-                );
-                latest.insert(reading.signal, reading.value);
-            }
-            _ = ticker.tick() => {
-                if !latest.is_empty() {
-                    info!("{}", format_latest(&latest));
-                }
+        let samples = match tokio::time::timeout(idle_flush, rx.recv()).await {
+            Ok(Some(reading)) => aggregator.push(&reading),
+            Ok(None) => break,
+            Err(_idle) => aggregator.flush(),
+        };
+        for sample in samples {
+            debug!(signal = sample.signal, value = sample.value, "sample");
+            if tx.send(sample).await.is_err() {
+                return;
             }
         }
     }
-    latest
+    for sample in aggregator.flush() {
+        if tx.send(sample).await.is_err() {
+            return;
+        }
+    }
 }
 
-pub fn format_latest(latest: &BTreeMap<Signal, f64>) -> String {
-    latest
-        .iter()
-        .map(|(signal, value)| match signal {
-            Signal::LatitudeDeg | Signal::LongitudeDeg => format!("{signal}={value:.6}"),
-            _ => format!("{signal}={value:.1}"),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Writes samples to the outbox, grouping whatever is already queued into one transaction.
+pub async fn write_samples(
+    mut rx: mpsc::Receiver<Sample>,
+    outbox: OutboxHandle,
+    work_waiting: Arc<Notify>,
+    batch_size: usize,
+) -> Result<u64, OutboxError> {
+    let mut written = 0;
+    while let Some(first) = rx.recv().await {
+        let mut samples = vec![first];
+        while samples.len() < WRITE_CHUNK {
+            match rx.try_recv() {
+                Ok(sample) => samples.push(sample),
+                Err(_) => break,
+            }
+        }
+        written += samples.len() as u64;
+        if outbox.append(samples).await? >= batch_size as u64 {
+            work_waiting.notify_one();
+        }
+    }
+    Ok(written)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::source::ReplaySource;
+    use std::time::UNIX_EPOCH;
+
+    use crate::decode::Signal;
 
     use super::*;
 
-    #[tokio::test]
-    async fn runs_a_replay_to_the_end() {
-        let log = "\
-(1.000000) vcan0 0CF00400#FFFFFFE02EFFFFFF
-(1.010000) vcan0 18FEEE00#7DFFFFFFFFFFFFFF
-(1.020000) vcan0 18FF1200#0011223344556677
-(1.030000) vcan0 0CF00400#FFFF
-(1.040000) vcan0 0CF00400#FFFFFF0032FFFFFF
-";
-        let summary = run(ReplaySource::new(log.as_bytes(), false)).await.unwrap();
-
-        assert_eq!(summary.frames_read, 5);
-        assert_eq!(
-            summary.stats,
-            DecodeStats {
-                frames: 5,
-                decoded: 3,
-                unknown_pgn: 1,
-                invalid_length: 1,
-            }
-        );
-        assert_eq!(
-            summary.latest,
-            BTreeMap::from([
-                (Signal::EngineSpeedRpm, 1600.0),
-                (Signal::CoolantTempC, 85.0)
-            ])
-        );
+    fn reading(millis: u64, value: f64) -> Reading {
+        Reading {
+            timestamp: UNIX_EPOCH + Duration::from_millis(millis),
+            source_address: 0,
+            signal: Signal::CoolantTempC,
+            value,
+        }
     }
 
-    #[test]
-    fn formats_latest_values() {
-        let latest = BTreeMap::from([
-            (Signal::EngineSpeedRpm, 1999.875),
-            (Signal::LatitudeDeg, 49.47191234),
-        ]);
-        assert_eq!(
-            format_latest(&latest),
-            "engine_speed_rpm=1999.9 latitude_deg=49.471912"
-        );
+    #[tokio::test(start_paused = true)]
+    async fn quiet_input_closes_the_bucket() {
+        let (reading_tx, reading_rx) = mpsc::channel(8);
+        let (sample_tx, mut sample_rx) = mpsc::channel(8);
+        tokio::spawn(aggregate(reading_rx, sample_tx, Duration::from_secs(2)));
+
+        reading_tx.send(reading(1_000, 80.0)).await.unwrap();
+        let sample = sample_rx.recv().await.unwrap();
+        assert_eq!(sample.value, 80.0);
+        assert_eq!(sample.ts, UNIX_EPOCH + Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn end_of_input_flushes_the_last_bucket() {
+        let (reading_tx, reading_rx) = mpsc::channel(8);
+        let (sample_tx, mut sample_rx) = mpsc::channel(8);
+        let task = tokio::spawn(aggregate(reading_rx, sample_tx, Duration::from_secs(60)));
+
+        reading_tx.send(reading(1_000, 80.0)).await.unwrap();
+        reading_tx.send(reading(2_000, 81.0)).await.unwrap();
+        drop(reading_tx);
+        task.await.unwrap();
+
+        let mut values = Vec::new();
+        while let Some(sample) = sample_rx.recv().await {
+            values.push(sample.value);
+        }
+        assert_eq!(values, [80.0, 81.0]);
     }
 }
