@@ -1,0 +1,22 @@
+# edge-agent configuration. Copy to /etc/edge-agent/config.toml.
+# Every key can be overridden with an environment variable: EDGE_<KEY IN UPPER CASE>,
+# e.g. EDGE_RECEIVER_URL. Keep the token out of this file and set EDGE_RECEIVER_TOKEN
+# in /etc/edge-agent/env (mode 0600) instead.
+
+device_id = "tractor-1"
+iface = "can0"
+
+receiver_url = "https://telemetry.example.com"
+
+# Records per upload request (max 10000) and how often to upload at the latest.
+batch_size = 500
+flush_interval_secs = 5.0
+# How long the last upload attempt on shutdown may take. Keep it below TimeoutStopSec.
+final_flush_secs = 10.0
+
+# systemd's StateDirectory=edge-agent creates /var/lib/edge-agent for us.
+outbox_path = "/var/lib/edge-agent/outbox.db"
+# About 20 hours offline at ~7 samples per second. Oldest records are dropped beyond that.
+outbox_cap = 500000
+
+health_interval_secs = 30.0

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rand::Rng;
 use reqwest::StatusCode;
@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::metrics::Metrics;
 use crate::outbox::{Batch, OutboxError, OutboxHandle};
 
 #[derive(Debug, Clone)]
@@ -104,6 +105,7 @@ pub struct Uplink {
     client: reqwest::Client,
     outbox: OutboxHandle,
     work_waiting: Arc<Notify>,
+    metrics: Arc<Metrics>,
     backoff: Backoff,
     stats: UplinkStats,
 }
@@ -114,6 +116,7 @@ impl Uplink {
         config: UplinkConfig,
         outbox: OutboxHandle,
         work_waiting: Arc<Notify>,
+        metrics: Arc<Metrics>,
     ) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
@@ -125,6 +128,7 @@ impl Uplink {
             client,
             outbox,
             work_waiting,
+            metrics,
             stats: UplinkStats::default(),
         })
     }
@@ -173,6 +177,7 @@ impl Uplink {
             match self.send(&batch).await {
                 Ok(response) => {
                     self.outbox.ack(last_seq, batch.dropped_records).await?;
+                    self.metrics.record_upload(SystemTime::now());
                     self.backoff.reset();
                     self.stats.batches += 1;
                     self.stats.records += batch.records.len() as u64;
@@ -192,6 +197,7 @@ impl Uplink {
                 }
                 Err(e) => {
                     self.stats.failures += 1;
+                    self.metrics.add_upload_failure();
                     let delay = self.backoff.next_delay(&mut rand::rng());
                     match &e {
                         SendError::Status(status) if status.is_client_error() => {

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use edge_agent::decode::DecodeStats;
 use edge_agent::outbox::Outbox;
-use edge_agent::pipeline::{self, Summary};
+use edge_agent::pipeline::{self, PipelineConfig, Summary};
 use edge_agent::source::ReplaySource;
 use edge_agent::uplink::UplinkConfig;
 use serde_json::{Value, json};
@@ -104,17 +104,20 @@ impl FakeReceiver {
     }
 }
 
-fn config(url: &str, final_flush: Duration) -> UplinkConfig {
-    UplinkConfig {
-        url: url.to_owned(),
-        token: TOKEN.to_owned(),
-        device_id: DEVICE.to_owned(),
-        batch_size: BATCH_SIZE,
-        flush_interval: Duration::from_millis(20),
-        request_timeout: Duration::from_secs(2),
-        final_flush_timeout: final_flush,
-        backoff_base: Duration::from_millis(5),
-        backoff_max: Duration::from_millis(40),
+fn config(url: &str, final_flush: Duration) -> PipelineConfig {
+    PipelineConfig {
+        uplink: UplinkConfig {
+            url: url.to_owned(),
+            token: TOKEN.to_owned(),
+            device_id: DEVICE.to_owned(),
+            batch_size: BATCH_SIZE,
+            flush_interval: Duration::from_millis(20),
+            request_timeout: Duration::from_secs(2),
+            final_flush_timeout: final_flush,
+            backoff_base: Duration::from_millis(5),
+            backoff_max: Duration::from_millis(40),
+        },
+        health_interval: Duration::from_secs(3600),
     }
 }
 

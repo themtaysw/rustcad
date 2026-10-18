@@ -172,3 +172,45 @@ outbox. The uplink stops waiting and backing off, but lets a running request fin
 a final attempt bounded by `final_flush_timeout`. An early version cancelled the request
 instead; the receiver had already stored the batch, and the restart test caught it being sent
 again in full.
+
+## edge-agent: config is defaults < TOML file < `EDGE_*` environment
+The file holds the per-device setup, the environment holds what differs per deployment or must
+stay out of files (the token, via systemd's `EnvironmentFile`). Loading is hand-written with
+`toml` + serde instead of a layering crate: ten fields, explicit, easy to review. Unknown keys
+are rejected so a typo like `batch_sise` fails at startup instead of silently using a default.
+Validation reports every problem at once. `Config::load` takes the env lookup as a function,
+so tests never modify the real process environment (`set_var` is `unsafe` in edition 2024).
+
+## edge-agent: the token is a `Secret` type
+`Secret` wraps the token and prints `<redacted>` in `Debug`, so `info!(?config)` at startup
+can log the whole config without leaking it. The raw value is only read where the request is
+built.
+
+## edge-agent: health line with live atomic counters
+Every `health_interval_secs` (default 30 s) the agent logs frames/s, unknown PGNs, decode
+errors, samples, outbox depth, upload failures and time since the last successful upload.
+Tasks bump `AtomicU64` counters in a shared `Arc<Metrics>` with `Relaxed` ordering: each
+counter stands alone and is only read for logging. Unknown PGNs are counted apart from decode
+errors because a real bus is full of PGNs we do not decode; only wrong lengths mean a broken
+sender.
+
+## ops: SIGTERM and SIGINT both start the graceful shutdown
+systemd stops services with SIGTERM, a terminal sends SIGINT; both cancel the same token. The
+reader stops, the pipeline drains into the outbox, the uplink makes its final attempt, the
+process exits 0. A second signal exits immediately with 130. `TimeoutStopSec=30` in the unit
+is longer than `final_flush_secs` so systemd never has to SIGKILL a clean shutdown.
+
+## ops: systemd unit with `DynamicUser` and `StateDirectory`
+`DynamicUser=yes` gives the agent its own unprivileged user without a `useradd` step, and
+`StateDirectory=edge-agent` creates `/var/lib/edge-agent` owned by that user, which is the only
+writable path (`ProtectSystem=strict`). `RestrictAddressFamilies` allows CAN, IP, Unix and
+netlink sockets and nothing else. `Restart=on-failure` brings the agent back after a crash or
+SIGKILL; tested in the VM by killing it mid-run, with no seq gaps in Postgres afterwards.
+Readings still in memory at that moment (at most the current second) are lost; everything that
+reached the outbox is not.
+
+## ops: release profile
+`lto = true`, `codegen-units = 1`, `strip = true` and `panic = "abort"`: edge-agent is 6.7 MB on
+aarch64, most of it TLS (rustls with aws-lc) and bundled SQLite. `opt-level = "z"` would shrink it
+further at the cost of speed; not needed at this size. With `panic = "abort"` a bug kills the
+process at once and systemd restarts it, which SQLite handles fine.

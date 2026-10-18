@@ -8,3 +8,14 @@ edition = "2024"
 
 [workspace.dependencies]
 thiserror = "2"
+
+# Small binary for edge devices with little flash. LTO and one codegen unit make the build
+# slower but the binary smaller and a bit faster. opt-level = "z" would shrink it further at
+# the cost of speed; at our load either is fine, so we keep the default speed optimization.
+# panic = "abort": a panic is a bug, so the process exits at once and systemd restarts it.
+# The outbox is safe with that, SQLite survives being killed mid-transaction.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -11,6 +11,7 @@ use tracing::{debug, warn};
 use crate::aggregate::{Aggregator, Sample};
 use crate::decode::{DecodeStats, Reading, decode_frame};
 use crate::frame::Frame;
+use crate::metrics::{self, Metrics};
 use crate::outbox::{Outbox, OutboxError, OutboxHandle};
 use crate::source::FrameSource;
 use crate::uplink::{Uplink, UplinkConfig, UplinkStats};
@@ -31,6 +32,12 @@ pub enum PipelineError {
     Http(#[from] reqwest::Error),
 }
 
+#[derive(Debug, Clone)]
+pub struct PipelineConfig {
+    pub uplink: UplinkConfig,
+    pub health_interval: Duration,
+}
+
 #[derive(Debug)]
 pub struct Summary {
     pub frames_read: u64,
@@ -48,30 +55,49 @@ pub struct Summary {
 pub async fn run<S>(
     source: S,
     outbox: Outbox,
-    config: UplinkConfig,
+    config: PipelineConfig,
     shutdown: CancellationToken,
 ) -> Result<Summary, PipelineError>
 where
     S: FrameSource + Send + 'static,
 {
     let outbox = OutboxHandle::new(outbox);
+    let metrics = Arc::new(Metrics::default());
     let work_waiting = Arc::new(Notify::new());
-    let batch_size = config.batch_size;
-    let uplink = Uplink::new(config, outbox.clone(), Arc::clone(&work_waiting))?;
+    let batch_size = config.uplink.batch_size;
+    let uplink = Uplink::new(
+        config.uplink,
+        outbox.clone(),
+        Arc::clone(&work_waiting),
+        Arc::clone(&metrics),
+    )?;
     let uplink_shutdown = CancellationToken::new();
+    let health_stop = CancellationToken::new();
 
     let (frame_tx, frame_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (reading_tx, reading_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (sample_tx, sample_rx) = mpsc::channel(CHANNEL_CAPACITY);
 
-    let reader = tokio::spawn(read_frames(source, frame_tx, shutdown));
-    let decoder = tokio::spawn(decode_frames(frame_rx, reading_tx));
+    let health = tokio::spawn(metrics::log_health(
+        Arc::clone(&metrics),
+        outbox.clone(),
+        config.health_interval,
+        health_stop.clone(),
+    ));
+    let reader = tokio::spawn(read_frames(
+        source,
+        frame_tx,
+        shutdown,
+        Arc::clone(&metrics),
+    ));
+    let decoder = tokio::spawn(decode_frames(frame_rx, reading_tx, Arc::clone(&metrics)));
     let aggregator = tokio::spawn(aggregate(reading_rx, sample_tx, IDLE_FLUSH));
     let writer = tokio::spawn(write_samples(
         sample_rx,
         outbox.clone(),
         work_waiting,
         batch_size,
+        Arc::clone(&metrics),
     ));
     let uplink = tokio::spawn(uplink.run(uplink_shutdown.clone()));
 
@@ -83,6 +109,8 @@ where
     // Everything that will ever reach the outbox is there now.
     uplink_shutdown.cancel();
     let uplink = uplink.await.expect("uplink task panicked");
+    health_stop.cancel();
+    health.await.expect("health task panicked");
 
     Ok(Summary {
         frames_read: frames_read?,
@@ -97,6 +125,7 @@ pub async fn read_frames<S: FrameSource>(
     mut source: S,
     tx: mpsc::Sender<Frame>,
     shutdown: CancellationToken,
+    metrics: Arc<Metrics>,
 ) -> io::Result<u64> {
     let mut count = 0;
     loop {
@@ -109,6 +138,7 @@ pub async fn read_frames<S: FrameSource>(
             break;
         }
         count += 1;
+        metrics.add_frame();
     }
     Ok(count)
 }
@@ -116,6 +146,7 @@ pub async fn read_frames<S: FrameSource>(
 pub async fn decode_frames(
     mut rx: mpsc::Receiver<Frame>,
     tx: mpsc::Sender<Reading>,
+    metrics: Arc<Metrics>,
 ) -> DecodeStats {
     let mut stats = DecodeStats::default();
     while let Some(frame) = rx.recv().await {
@@ -128,9 +159,11 @@ pub async fn decode_frames(
                 }
             }
             Err(e @ DecodeError::UnknownPgn(_)) => {
+                metrics.add_unknown_pgn();
                 debug!(id = format_args!("{:08X}", frame.id), error = %e, "skipping frame");
             }
             Err(e @ DecodeError::InvalidLength { .. }) => {
+                metrics.add_decode_error();
                 warn!(id = format_args!("{:08X}", frame.id), error = %e, "skipping frame");
             }
         }
@@ -170,6 +203,7 @@ pub async fn write_samples(
     outbox: OutboxHandle,
     work_waiting: Arc<Notify>,
     batch_size: usize,
+    metrics: Arc<Metrics>,
 ) -> Result<u64, OutboxError> {
     let mut written = 0;
     while let Some(first) = rx.recv().await {
@@ -180,7 +214,9 @@ pub async fn write_samples(
                 Err(_) => break,
             }
         }
-        written += samples.len() as u64;
+        let n = samples.len() as u64;
+        written += n;
+        metrics.add_samples(n);
         if outbox.append(samples).await? >= batch_size as u64 {
             work_waiting.notify_one();
         }

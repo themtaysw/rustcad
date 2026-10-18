@@ -1,0 +1,48 @@
+# Install:
+#   install -m 0755 edge-agent /usr/local/bin/edge-agent
+#   install -d /etc/edge-agent
+#   install -m 0644 deploy/config.example.toml /etc/edge-agent/config.toml   # then edit
+#   install -m 0600 /dev/null /etc/edge-agent/env   # add EDGE_RECEIVER_TOKEN=...
+#   install -m 0644 deploy/edge-agent.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now edge-agent
+
+[Unit]
+Description=Tractor telemetry edge agent (J1939 -> outbox -> receiver)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/edge-agent --config /etc/edge-agent/config.toml
+# Read by systemd as root before dropping privileges, so the token file can stay 0600 root.
+EnvironmentFile=/etc/edge-agent/env
+
+# A dedicated, unprivileged user that systemd creates on start. It owns only the state dir.
+DynamicUser=yes
+StateDirectory=edge-agent
+StateDirectoryMode=0700
+
+Restart=on-failure
+RestartSec=5
+# SIGTERM starts the graceful shutdown: drain into the outbox, final upload (final_flush_secs),
+# exit. TimeoutStopSec must be longer than that, or systemd sends SIGKILL first.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Hardening. The agent needs CAN and network sockets and its state dir, nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_CAN AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
