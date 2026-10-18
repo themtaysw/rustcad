@@ -1,0 +1,13 @@
+[package]
+name = "tractor-sim"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+j1939 = { path = "../j1939" }
+rand = "0.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socketcan = "3"

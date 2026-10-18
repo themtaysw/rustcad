@@ -41,3 +41,30 @@ needs no mental arithmetic.
 `CanId::from_raw` takes a `u32` and ignores bits 29-31 instead of returning an error.
 Socket APIs often keep flag bits there (for example the extended-frame flag in Linux `can_id`),
 so the agent does not have to strip them first.
+
+## dev: Linux VM via Lima with its own cargo target directory
+SocketCAN only exists on Linux, so `deploy/lima-can.yaml` defines an Ubuntu VM with `vcan`
+and can-utils. The repo is mounted writable at the same path, but the VM builds into
+`~/target` (`CARGO_TARGET_DIR`). Sharing `target/` with macOS would mix incompatible artifacts
+and force full rebuilds on every switch.
+
+## tractor-sim: time is counted in ticks, not wall-clock
+The model advances by a fixed `dt = 1 / rate_hz` and each PGN is sent every N ticks.
+The simulation is deterministic for a given `--seed`, so tests check exact frame counts.
+The main loop sleeps until absolute deadlines (`start + n * tick`) so the rate does not drift.
+
+## tractor-sim: send rates
+EEC1 goes out on every tick (default 20 Hz). CCVS and LFE use 100 ms and ET1 1 s, like the
+J1939-71 defaults. Vehicle position uses 1 s instead of the 5 s default, typical for a GPS
+receiver and gives a smoother track. A period shorter than one tick is sent every tick.
+
+## tractor-sim: what `--garbage-rate` injects
+Each tick, with the given probability, one extra frame of a random kind: a proprietary PGN
+(0xFF00-0xFFFF, never one we decode) with random data, an EEC1 frame shorter than 8 bytes,
+or a known PGN with all 0xFF ("not available"). These hit exactly the three paths the agent
+must survive: `UnknownPgn`, `InvalidLength` and `None` values.
+
+## tractor-sim: `--dry-run` writes candump log format
+Without a CAN interface (macOS, CI) the simulator prints `(ts) iface ID#DATA` lines to stdout,
+the same format as `candump -l`. The agent's replay source reads that format, so fixtures can
+be generated without a VM.

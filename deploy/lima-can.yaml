@@ -1,0 +1,62 @@
+# Linux VM for SocketCAN development (vcan0, can-utils, Rust).
+#
+#   limactl start --name=can --mount "$PWD:w" deploy/lima-can.yaml
+#   limactl shell can
+#
+# The repo is mounted writable at the same path as on macOS. Linux builds go to
+# ~/target (CARGO_TARGET_DIR) so they never mix with the macOS target/ directory.
+
+minimumLimaVersion: "1.0.0"
+
+vmType: vz
+cpus: 4
+memory: 4GiB
+disk: 30GiB
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+mountType: virtiofs
+mounts: []
+
+containerd:
+  system: false
+  user: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      # vcan.ko lives in linux-modules-extra on Ubuntu cloud kernels.
+      if ! modinfo vcan >/dev/null 2>&1; then
+        apt-get update
+        apt-get install -y "linux-modules-extra-$(uname -r)"
+      fi
+      if ! command -v candump >/dev/null 2>&1; then
+        apt-get update
+        apt-get install -y can-utils build-essential pkg-config curl
+      fi
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy,rustfmt
+      fi
+      grep -q CARGO_TARGET_DIR "$HOME/.profile" || echo 'export CARGO_TARGET_DIR="$HOME/target"' >> "$HOME/.profile"
+
+probes:
+  - description: "cargo installed"
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      if ! timeout 600s bash -c "until [ -x \"$HOME/.cargo/bin/cargo\" ]; do sleep 3; done"; then
+        echo >&2 "cargo is not installed yet"
+        exit 1
+      fi
+    hint: See /var/log/cloud-init-output.log in the guest.
