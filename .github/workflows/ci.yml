@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    # Linux, so the SocketCAN code behind cfg(target_os = "linux") is compiled and linted too.
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  receiver:
+    name: Receiver (ruff, pytest, image)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloud/receiver
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: telemetry
+          POSTGRES_PASSWORD: telemetry
+          POSTGRES_DB: telemetry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U telemetry -d telemetry"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      TEST_DATABASE_ADMIN_URL: postgresql://telemetry:telemetry@localhost:5432/telemetry
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uvx ruff check .
+      - run: uvx ruff format --check .
+      - run: uv run pytest -v
+      - run: docker build -t receiver .

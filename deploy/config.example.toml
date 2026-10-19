@@ -16,7 +16,7 @@ final_flush_secs = 10.0
 
 # systemd's StateDirectory=edge-agent creates /var/lib/edge-agent for us.
 outbox_path = "/var/lib/edge-agent/outbox.db"
-# About 20 hours offline at ~7 samples per second. Oldest records are dropped beyond that.
+# About 17 hours offline at 8 samples per second. Oldest records are dropped beyond that.
 outbox_cap = 500000
 
 health_interval_secs = 30.0

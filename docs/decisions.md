@@ -214,3 +214,17 @@ reached the outbox is not.
 aarch64, most of it TLS (rustls with aws-lc) and bundled SQLite. `opt-level = "z"` would shrink it
 further at the cost of speed; not needed at this size. With `panic = "abort"` a bug kills the
 process at once and systemd restarts it, which SQLite handles fine.
+
+## known limitation: a new outbox restarts `seq` at 1
+`seq` is unique per outbox file, but the receiver dedupes on `(device_id, seq)`. If a device
+gets a fresh outbox (reinstall, deleted state dir, replaced SD card) under the same
+`device_id`, its first records reuse old numbers and the receiver drops them as duplicates.
+Seen for real in the quickstart test: `inserted=5 duplicates=3` on a device that already had
+seq 1-3. Fix: generate an `outbox_id` (UUID) when the outbox is created, send it with every
+batch and dedupe on `(device_id, outbox_id, seq)`. Not done yet.
+
+## ci: GitHub Actions on Linux
+One job runs `cargo fmt --check`, clippy with `-D warnings` and the tests on ubuntu, so the
+SocketCAN code behind `cfg(target_os = "linux")` is compiled and linted, which it is not on a
+Mac. A second job runs ruff, pytest against a Postgres service container and `docker build`
+for the receiver. `--locked` / `uv sync --locked` make CI fail if a lock file is out of date.
