@@ -46,6 +46,11 @@ impl Spn {
     /// Out-of-range values are clamped. `None` and non-finite values encode as "not available".
     pub fn encode(self, value: Option<f64>, data: &mut [u8; 8]) {
         let raw = match value {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "clamped to 0..=max_valid, which fits in u32"
+            )]
             Some(v) if v.is_finite() => {
                 let max = f64::from(self.width.max_valid());
                 ((v - self.offset) / self.resolution)

@@ -1,4 +1,3 @@
-use std::fmt;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -7,37 +6,11 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::secret::Secret;
 use crate::uplink::UplinkConfig;
 
 /// Must stay in line with the receiver's `MAX_RECORDS_PER_BATCH`.
 const MAX_BATCH_SIZE: usize = 10_000;
-
-/// A string that never shows up in logs or `Debug` output.
-#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(transparent)]
-pub struct Secret(String);
-
-impl Secret {
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(if self.0.is_empty() {
-            "<unset>"
-        } else {
-            "<redacted>"
-        })
-    }
-}
-
-impl From<&str> for Secret {
-    fn from(s: &str) -> Self {
-        Self(s.to_owned())
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -125,7 +98,7 @@ impl Config {
         override_from(env, "EDGE_IFACE", &mut self.iface)?;
         override_from(env, "EDGE_RECEIVER_URL", &mut self.receiver_url)?;
         if let Some(token) = env("EDGE_RECEIVER_TOKEN") {
-            self.receiver_token = Secret(token);
+            self.receiver_token = Secret::from(token);
         }
         override_from(env, "EDGE_BATCH_SIZE", &mut self.batch_size)?;
         override_from(
@@ -171,13 +144,19 @@ impl Config {
         if !(1..=MAX_BATCH_SIZE).contains(&self.batch_size) {
             problems.push(format!("batch_size must be 1-{MAX_BATCH_SIZE}"));
         }
-        for (name, secs) in [
-            ("flush_interval_secs", self.flush_interval_secs),
-            ("final_flush_secs", self.final_flush_secs),
-            ("health_interval_secs", self.health_interval_secs),
+        for (name, secs, min, max) in [
+            ("flush_interval_secs", self.flush_interval_secs, 0.1, 3600.0),
+            ("final_flush_secs", self.final_flush_secs, 0.1, 3600.0),
+            (
+                "health_interval_secs",
+                self.health_interval_secs,
+                1.0,
+                86_400.0,
+            ),
         ] {
-            if !(secs.is_finite() && secs > 0.0) {
-                problems.push(format!("{name} must be a positive number"));
+            // Also rejects NaN, which fails every comparison.
+            if !(min..=max).contains(&secs) {
+                problems.push(format!("{name} must be between {min} and {max}"));
             }
         }
         if self.outbox_cap == 0 {
@@ -198,7 +177,7 @@ impl Config {
     pub fn uplink(&self) -> UplinkConfig {
         UplinkConfig {
             url: self.receiver_url.clone(),
-            token: self.receiver_token.expose().to_owned(),
+            token: self.receiver_token.clone(),
             device_id: self.device_id.clone(),
             batch_size: self.batch_size,
             flush_interval: Duration::from_secs_f64(self.flush_interval_secs),
@@ -376,11 +355,23 @@ mod tests {
                 ("EDGE_RECEIVER_URL", "ftp://x"),
                 ("EDGE_BATCH_SIZE", "0"),
                 ("EDGE_FLUSH_INTERVAL_SECS", "-1"),
+                ("EDGE_FINAL_FLUSH_SECS", "1e30"),
                 ("EDGE_HEALTH_INTERVAL_SECS", "NaN"),
                 ("EDGE_OUTBOX_CAP", "0"),
             ]),
         ));
-        assert_eq!(problems.len(), 6, "{problems:#?}");
+        assert_eq!(
+            problems,
+            [
+                "device_id must be 1-64 characters of A-Z a-z 0-9 . _ -",
+                "receiver_url \"ftp://x\" is not an http(s) URL",
+                "batch_size must be 1-10000",
+                "flush_interval_secs must be between 0.1 and 3600",
+                "final_flush_secs must be between 0.1 and 3600",
+                "health_interval_secs must be between 1 and 86400",
+                "outbox_cap must be at least 1",
+            ]
+        );
     }
 
     #[test]

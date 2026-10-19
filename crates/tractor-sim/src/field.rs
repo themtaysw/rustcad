@@ -34,7 +34,7 @@ pub fn locate(distance_m: f64) -> Location {
 
     let row = (distance_m / lap).floor();
     let along = distance_m - row * lap;
-    let northbound = (row as u64).is_multiple_of(2);
+    let northbound = row.rem_euclid(2.0) < 1.0;
     let row_east = row * ROW_SPACING_M;
 
     if along < ROW_LENGTH_M {
@@ -113,7 +113,7 @@ mod tests {
     fn path_is_continuous() {
         let mut previous = locate(0.0);
         for step in 1..20_000 {
-            let current = locate(step as f64 * 0.1);
+            let current = locate(f64::from(step) * 0.1);
             let jump = (current.east_m - previous.east_m).hypot(current.north_m - previous.north_m);
             assert!(jump <= 0.1 + 1e-9, "jump of {jump} m at step {step}");
             previous = current;

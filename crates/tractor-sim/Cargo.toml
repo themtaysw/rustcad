@@ -1,13 +1,20 @@
 [package]
 name = "tractor-sim"
+description = "Simulated tractor writing J1939 frames to a CAN interface"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-j1939 = { path = "../j1939" }
-rand = "0.9"
+anyhow.workspace = true
+clap.workspace = true
+j1939.workspace = true
+rand.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-socketcan = "3"
+socketcan.workspace = true
+
+[lints]
+workspace = true

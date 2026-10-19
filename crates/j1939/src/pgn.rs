@@ -5,10 +5,12 @@ const NOT_AVAILABLE: [u8; 8] = [0xFF; 8];
 /// Electronic Engine Controller 1.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Eec1 {
+    /// Engine speed in rpm. `None` if not available.
     pub engine_speed_rpm: Option<f64>,
 }
 
 impl Eec1 {
+    /// Parameter group number.
     pub const PGN: u32 = 61444;
 
     const ENGINE_SPEED: Spn = Spn {
@@ -18,12 +20,16 @@ impl Eec1 {
         offset: 0.0,
     };
 
+    /// Decodes an 8-byte payload. Error and not-available values become `None`.
+    #[must_use]
     pub fn decode(data: &[u8; 8]) -> Self {
         Self {
             engine_speed_rpm: Self::ENGINE_SPEED.decode(data),
         }
     }
 
+    /// Encodes into an 8-byte payload. Unused bytes and `None` signals are 0xFF.
+    #[must_use]
     pub fn encode(&self) -> [u8; 8] {
         let mut data = NOT_AVAILABLE;
         Self::ENGINE_SPEED.encode(self.engine_speed_rpm, &mut data);
@@ -34,10 +40,12 @@ impl Eec1 {
 /// Engine Temperature 1.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Et1 {
+    /// Engine coolant temperature in °C. `None` if not available.
     pub coolant_temp_c: Option<f64>,
 }
 
 impl Et1 {
+    /// Parameter group number.
     pub const PGN: u32 = 65262;
 
     const COOLANT_TEMP: Spn = Spn {
@@ -47,12 +55,16 @@ impl Et1 {
         offset: -40.0,
     };
 
+    /// Decodes an 8-byte payload. Error and not-available values become `None`.
+    #[must_use]
     pub fn decode(data: &[u8; 8]) -> Self {
         Self {
             coolant_temp_c: Self::COOLANT_TEMP.decode(data),
         }
     }
 
+    /// Encodes into an 8-byte payload. Unused bytes and `None` signals are 0xFF.
+    #[must_use]
     pub fn encode(&self) -> [u8; 8] {
         let mut data = NOT_AVAILABLE;
         Self::COOLANT_TEMP.encode(self.coolant_temp_c, &mut data);
@@ -63,10 +75,12 @@ impl Et1 {
 /// Fuel Economy (Liquid).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Lfe {
+    /// Fuel rate in litres per hour. `None` if not available.
     pub fuel_rate_lph: Option<f64>,
 }
 
 impl Lfe {
+    /// Parameter group number.
     pub const PGN: u32 = 65266;
 
     const FUEL_RATE: Spn = Spn {
@@ -76,12 +90,16 @@ impl Lfe {
         offset: 0.0,
     };
 
+    /// Decodes an 8-byte payload. Error and not-available values become `None`.
+    #[must_use]
     pub fn decode(data: &[u8; 8]) -> Self {
         Self {
             fuel_rate_lph: Self::FUEL_RATE.decode(data),
         }
     }
 
+    /// Encodes into an 8-byte payload. Unused bytes and `None` signals are 0xFF.
+    #[must_use]
     pub fn encode(&self) -> [u8; 8] {
         let mut data = NOT_AVAILABLE;
         Self::FUEL_RATE.encode(self.fuel_rate_lph, &mut data);
@@ -92,10 +110,12 @@ impl Lfe {
 /// Cruise Control / Vehicle Speed.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Ccvs {
+    /// Wheel-based vehicle speed in km/h. `None` if not available.
     pub wheel_speed_kmh: Option<f64>,
 }
 
 impl Ccvs {
+    /// Parameter group number.
     pub const PGN: u32 = 65265;
 
     const WHEEL_SPEED: Spn = Spn {
@@ -105,12 +125,16 @@ impl Ccvs {
         offset: 0.0,
     };
 
+    /// Decodes an 8-byte payload. Error and not-available values become `None`.
+    #[must_use]
     pub fn decode(data: &[u8; 8]) -> Self {
         Self {
             wheel_speed_kmh: Self::WHEEL_SPEED.decode(data),
         }
     }
 
+    /// Encodes into an 8-byte payload. Unused bytes and `None` signals are 0xFF.
+    #[must_use]
     pub fn encode(&self) -> [u8; 8] {
         let mut data = NOT_AVAILABLE;
         Self::WHEEL_SPEED.encode(self.wheel_speed_kmh, &mut data);
@@ -121,11 +145,14 @@ impl Ccvs {
 /// Vehicle Position.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct VehiclePosition {
+    /// Latitude in degrees, positive north. `None` if not available.
     pub latitude_deg: Option<f64>,
+    /// Longitude in degrees, positive east. `None` if not available.
     pub longitude_deg: Option<f64>,
 }
 
 impl VehiclePosition {
+    /// Parameter group number.
     pub const PGN: u32 = 65267;
 
     const LATITUDE: Spn = Spn {
@@ -140,6 +167,8 @@ impl VehiclePosition {
         ..Self::LATITUDE
     };
 
+    /// Decodes an 8-byte payload. Error and not-available values become `None`.
+    #[must_use]
     pub fn decode(data: &[u8; 8]) -> Self {
         Self {
             latitude_deg: Self::LATITUDE.decode(data),
@@ -147,6 +176,8 @@ impl VehiclePosition {
         }
     }
 
+    /// Encodes into an 8-byte payload. Unused bytes and `None` signals are 0xFF.
+    #[must_use]
     pub fn encode(&self) -> [u8; 8] {
         let mut data = NOT_AVAILABLE;
         Self::LATITUDE.encode(self.latitude_deg, &mut data);

@@ -1,5 +1,7 @@
 import pytest
 
+from receiver.app import create_app
+
 
 def record(seq, signal="engine_speed_rpm", value=1500.0, ts="2026-10-18T10:00:00Z"):
     return {"seq": seq, "ts": ts, "signal": signal, "value": value}
@@ -121,6 +123,8 @@ def test_empty_batch_is_accepted(client):
         batch(record(1), device_id="a/b"),
         batch(record(1), batch_id=""),
         batch(record(1), outbox_id=""),
+        batch(record(1), outbox_id="../x"),
+        batch(record(1), outbox_id=""),
         batch(record(1), outbox_id="x" * 65),
         {"device_id": "tractor-1", "outbox_id": "o", "records": [record(1)]},
         {"device_id": "tractor-1", "batch_id": "b", "records": [record(1)]},
@@ -169,3 +173,8 @@ def test_latest_unknown_device_is_404(client):
 def test_latest_needs_token(client):
     del client.headers["Authorization"]
     assert client.get("/devices/tractor-1/latest").status_code == 401
+
+
+def test_empty_token_is_refused_at_startup(database_url):
+    with pytest.raises(RuntimeError, match="RECEIVER_TOKEN"):
+        create_app(database_url=database_url, token="  ")

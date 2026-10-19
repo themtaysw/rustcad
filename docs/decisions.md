@@ -83,10 +83,12 @@ instead of growing memory without limit. Shutdown follows the channels: when the
 the reader drops its sender, the decoder drains and drops its sender, and so on.
 
 ## edge-agent: bad input is skipped and counted, never fatal
-A broken replay line is logged at `warn` and skipped. Unknown PGNs are counted and logged at
-`debug`, since a real bus is full of them. Frames with the wrong length are counted and logged at
-`warn`, because they point at a broken sender. "Not available" values decode fine but produce
-no `Reading`.
+A broken replay line is logged at `warn` and skipped: malformed, not UTF-8, longer than 256
+bytes, or a timestamp outside 1970..9999. Unknown PGNs are counted and logged at `debug`, since
+a real bus is full of them. Frames with the wrong length are counted and logged at `warn`,
+because they point at a broken sender; only the first 20 are logged one by one, the rest only
+show in the health line, so a broken sender at bus speed does not wear out the SD card with log
+writes. "Not available" values decode fine but produce no `Reading`.
 
 ## edge-agent: frame timestamps
 Replayed frames keep their log timestamp, so a replay produces the same aggregated samples as
@@ -134,6 +136,11 @@ which fits the receiver's `(signal, value)` schema without changing it. A bucket
 reading for another second arrives (in either direction, so a clock jump never stalls it),
 after 2 s without input, or when input ends.
 
+Known limitation: readings are keyed by signal only, not by source address. If two ECUs send
+the same PGN (on a real tractor CCVS can come from more than one), their values are merged
+into one series. The fix is to key by `(signal, source_address)` and carry the address to the
+receiver, or to configure which address is trusted for each signal.
+
 ## edge-agent: outbox rows are deleted on ack, `seq` uses AUTOINCREMENT
 Every row in the outbox is unsent, so "mark as sent" is `DELETE WHERE seq <= last_acked`.
 A plain `INTEGER PRIMARY KEY` would hand out the same number again after the newest rows are
@@ -151,9 +158,23 @@ The writer and the uplink share one `rusqlite::Connection`. It is `Send` but not
 `spawn_blocking` so a slow fsync never blocks the async worker threads. Two connections would
 allow more parallelism but make the cap and depth bookkeeping racy.
 
+## edge-agent: outbox schema is versioned
+The schema version lives in SQLite's `user_version`. A new file gets the tables and version 1
+in one transaction; a file with a higher version (written by a newer agent) or with tables but
+no version (not an outbox) is refused instead of being modified. Agent state is one row in a
+`state` table (`CHECK (id = 1)`) holding `outbox_id` and `dropped_records`, rather than a
+key-value table with mixed value types. A schema change bumps the version and adds a migration.
+
+## edge-agent: impossible timestamps never enter the outbox
+The receiver needs RFC 3339 timestamps, which end at year 9999. The replay parser rejects
+anything outside 1970..9999, using `checked_add` so a huge number cannot overflow
+`SystemTime`. `Outbox::append` checks again, because a live clock can be wrong too: such
+samples are not stored and count as dropped. A record the uplink cannot send would otherwise
+sit at the head of the queue and block it forever.
+
 ## edge-agent: outbox cap drops the oldest records
-When the outbox exceeds its cap, the oldest rows are deleted and `dropped_records` in a `meta`
-table is incremented in the same transaction. The next successful batch reports the counter
+When the outbox exceeds its cap, the oldest rows are deleted and `dropped_records` in the
+`state` row is incremented in the same transaction. The next successful batch reports the counter
 and the ack subtracts exactly the reported amount, so drops that happen while a batch is in
 flight are not lost. Dropping oldest keeps the most recent state, which is what an operator
 looks at first. If a batch in flight gets trimmed, those records are both delivered and counted
@@ -163,8 +184,10 @@ as dropped; the counter can over-report, never under-report.
 Network errors, timeouts and 5xx are retried with exponential backoff (500 ms doubling to 60 s)
 with equal jitter, so a fleet that lost coverage together does not retry in lockstep. 4xx are
 retried too, at error level: a wrong token is a config problem, and dropping data would not
-fix it. A batch id is the seq range (`first-last`), so a resend after a lost response has
-the same id and the receiver does not count its `dropped_records` twice.
+fix it. A batch that failed is kept in memory and resent exactly as it was, instead of being
+read from the outbox again: the writer keeps appending during the backoff, so a re-read batch
+would have grown, got a new id (`first-last` seq range) and made the receiver count its
+`dropped_records` twice. A test resends after two lost responses and compares the bodies.
 
 ## edge-agent: shutdown never aborts an upload in flight
 Shutdown stops the reader; every stage then drains in order, so all readings reach the
@@ -172,6 +195,14 @@ outbox. The uplink stops waiting and backing off, but lets a running request fin
 a final attempt bounded by `final_flush_timeout`. An early version cancelled the request
 instead; the receiver had already stored the batch, and the restart test caught it being sent
 again in full.
+
+## edge-agent: a failing stage stops the whole pipeline
+Stages are awaited in pipeline order, so on their own a dead uplink (say, a SQLite read error)
+would leave the agent reading the bus and filling the outbox with nobody uploading. Every
+stage that can fail is spawned through `spawn_stage`, which cancels the shared shutdown token
+on error: the pipeline drains, the process exits non-zero and systemd restarts it. Panics in
+tasks are re-raised with `resume_unwind`, so the original message is not lost behind a
+`JoinError`.
 
 ## edge-agent: config is defaults < TOML file < `EDGE_*` environment
 The file holds the per-device setup, the environment holds what differs per deployment or must
@@ -183,8 +214,8 @@ so tests never modify the real process environment (`set_var` is `unsafe` in edi
 
 ## edge-agent: the token is a `Secret` type
 `Secret` wraps the token and prints `<redacted>` in `Debug`, so `info!(?config)` at startup
-can log the whole config without leaking it. The raw value is only read where the request is
-built.
+can log the whole config without leaking it. The uplink config keeps the `Secret` too; the raw
+value is only read in `bearer_auth` where the request is built.
 
 ## edge-agent: health line with live atomic counters
 Every `health_interval_secs` (default 30 s) the agent logs frames/s, unknown PGNs, decode
@@ -192,12 +223,15 @@ errors, samples, outbox depth, upload failures and time since the last successfu
 Tasks bump `AtomicU64` counters in a shared `Arc<Metrics>` with `Relaxed` ordering: each
 counter stands alone and is only read for logging. Unknown PGNs are counted apart from decode
 errors because a real bus is full of PGNs we do not decode; only wrong lengths mean a broken
-sender.
+sender. The same counters produce the summary at exit, so there is one source of numbers. The
+outbox depth is mirrored in an atomic, so the health task never waits behind an fsync.
 
 ## ops: SIGTERM and SIGINT both start the graceful shutdown
 systemd stops services with SIGTERM, a terminal sends SIGINT; both cancel the same token. The
 reader stops, the pipeline drains into the outbox, the uplink makes its final attempt, the
-process exits 0. A second signal exits immediately with 130. `TimeoutStopSec=30` in the unit
+process exits 0. A second signal exits immediately with the usual 128 + signal number (130 for
+SIGINT, 143 for SIGTERM). Both handlers are registered once at startup, so a second signal can
+never arrive in a gap where the default handler is active. `TimeoutStopSec=30` in the unit
 is longer than `final_flush_secs` so systemd never has to SIGKILL a clean shutdown.
 
 ## ops: systemd unit with `DynamicUser` and `StateDirectory`
@@ -221,9 +255,8 @@ deleted state dir, replaced SD card) under the same `device_id` starts at seq 1 
 the old key `(device_id, seq)` the receiver dropped those records as duplicates (seen in the
 quickstart test: `inserted=5 duplicates=3` on a device that already had seq 1-3).
 
-The outbox now generates a random UUID v4 when the file is created and keeps it in a
-`meta_text` table. A separate table, because `meta.value` is `INTEGER`; older files simply get
-the table and an id on their next open. The id is sent as `outbox_id` with every batch, and
+The outbox generates a random UUID v4 when the file is created and keeps it in its `state`
+row. The id is sent as `outbox_id` with every batch, and
 the receiver's keys are `(device_id, outbox_id, seq)` and `(device_id, outbox_id, batch_id)`.
 A UUID instead of a counter or a boot id: nothing has to be coordinated with the receiver,
 and it changes exactly when the seq numbering restarts. `/devices/{id}/latest` still looks
@@ -251,3 +284,13 @@ One job runs `cargo fmt --check`, clippy with `-D warnings` and the tests on ubu
 SocketCAN code behind `cfg(target_os = "linux")` is compiled and linted, which it is not on a
 Mac. A second job runs ruff, pytest against a Postgres service container and `docker build`
 for the receiver. `--locked` / `uv sync --locked` make CI fail if a lock file is out of date.
+A third job builds with Rust 1.89, the `rust-version` in `Cargo.toml`, found by building with
+older toolchains: 1.88 fails because `uuid` needs 1.89. `cargo doc` runs with `-D warnings`.
+
+## rust: lints are part of the build
+`[workspace.lints]` forbids `unsafe` and turns on a selection of pedantic clippy lints, most
+importantly the `cast_*` family: every `as` that could truncate, wrap or lose a sign is either
+replaced (`try_from`, `From`, rusqlite's checked `u64` conversion) or carries an
+`#[expect(..., reason = "...")]` that says why it is safe. `expect` instead of `allow` makes the
+compiler complain if the justification ever stops being needed. `j1939`, the reusable library,
+also has `#![warn(missing_docs)]`.

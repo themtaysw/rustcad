@@ -1,7 +1,14 @@
 [package]
 name = "j1939"
+description = "SAE J1939 CAN ID parsing and decoding/encoding of a few PGNs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+
+[lints]
+workspace = true

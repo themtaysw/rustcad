@@ -5,9 +5,36 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
+repository = "https://github.com/themtaysw/rustcad"
+publish = false
 
 [workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+j1939 = { path = "crates/j1939" }
+rand = "0.9"
+socketcan = "3"
 thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# Lossy `as` casts must be justified with `#[expect(..., reason = "...")]` or replaced by
+# `try_from`/`From`, so a silent truncation or sign flip cannot slip in.
+[workspace.lints.clippy]
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+doc_markdown = "warn"
+ignored_unit_patterns = "warn"
+manual_let_else = "warn"
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+unused_async = "warn"
 
 # Small binary for edge devices with little flash. LTO and one codegen unit make the build
 # slower but the binary smaller and a bit faster. opt-level = "z" would shrink it further at

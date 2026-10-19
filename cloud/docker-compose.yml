@@ -25,6 +25,13 @@ services:
       RECEIVER_TOKEN: ${RECEIVER_TOKEN:-dev-token}
     ports:
       - "127.0.0.1:18000:8000"
+    healthcheck:
+      # The slim image has no curl; Python is there anyway.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
     depends_on:
       postgres:
         condition: service_healthy

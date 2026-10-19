@@ -40,7 +40,7 @@ FrameSource ─> decoder ─> aggregator ─> outbox writer ─> SQLite <─ upl
 
 ## Quickstart
 
-You need Rust, Docker (or OrbStack), and on macOS [Lima](https://lima-vm.io) for a Linux VM,
+You need Rust 1.89 or newer, Docker (or OrbStack), and on macOS [Lima](https://lima-vm.io) for a Linux VM,
 because SocketCAN only exists on Linux. [uv](https://docs.astral.sh/uv/) is needed to run the
 receiver tests.
 
@@ -118,17 +118,23 @@ EDGE_RECEIVER_TOKEN=dev-token cargo run -p edge-agent -- \
 - **At-least-once delivery, deduped by the receiver.** A batch is deleted from the outbox only
   after the receiver answers 2xx. If the answer is lost, the batch is sent again. The receiver
   stores records with `ON CONFLICT (device_id, outbox_id, seq) DO NOTHING`, so a resend
-  changes nothing. The batch id is the seq range, so a resent batch has the same id.
+  changes nothing. A failed batch is kept and resent unchanged, with the same `batch_id`, so
+  the receiver never counts its `dropped_records` twice.
 - **Retries never give up.** Network errors, timeouts, 5xx and even 4xx are retried with
   exponential backoff (0.5 s doubling to 60 s) and jitter, so a fleet coming back into coverage
   together does not hit the receiver in lockstep. A 4xx is logged as an error, since it
   usually means a wrong token, but the data stays.
 - **Graceful shutdown.** On SIGTERM or SIGINT the agent stops reading, lets every stage drain
   into the outbox and makes one final upload attempt (`final_flush_secs`). A request already
-  in flight is never aborted. Whatever is not uploaded stays in the outbox for the next start.
+  in flight is not aborted for the shutdown. Whatever is not uploaded stays in the outbox for the
+  next start.
+- **No silent failure.** If a stage fails (say, the disk), the whole pipeline drains and stops
+  and the process exits non-zero, so systemd restarts it, instead of reading on with nobody
+  uploading. A sample whose timestamp cannot be sent (a broken clock, year 10000) is dropped and
+  counted, so it can never block the queue.
 - **When the disk cap is hit.** The outbox holds at most `outbox_cap` records (default
-  500 000, about 17 hours offline at 8 samples per second). Beyond that the oldest records are deleted and a
-  `dropped_records` counter is incremented in the same transaction. The next successful batch
+  500 000, about 17 hours offline at 8 samples per second). Beyond that the oldest records are
+  deleted and a `dropped_records` counter is incremented in the same transaction. The next successful batch
   reports the counter to the receiver, which stores it per batch. Dropping the oldest keeps the
   most recent state, which is what an operator looks at first. The loss is visible, not silent.
 - **Crashes.** Under systemd, `Restart=on-failure` brings the agent back. What is already in
@@ -142,7 +148,11 @@ a real `candump` recording through the whole agent into a fake receiver:
   `seq` arrived and none is missing;
 - **restart**: three runs over the same outbox (network up, network down, network back). Seqs
   continue without gaps or reuse;
-- **outbox cap**: overflow drops the oldest and the next batch reports exactly how many.
+- **outbox cap**: overflow drops the oldest and the next batch reports exactly how many;
+- **retry**: after two lost responses the same batch is resent byte for byte;
+- **shutdown**: cancelling mid-run stops reading, and everything read is uploaded;
+- **fresh outbox**: a deleted outbox file starts at seq 1 again under a new `outbox_id`, and
+  nothing is deduped away.
 
 They were also checked live in the VM: the receiver was stopped for 15 s while the
 simulator ran, and the agent was killed with `kill -9` under systemd. Postgres afterwards had
@@ -200,9 +210,11 @@ uv run pytest
 ```
 
 The receiver tests use their own `telemetry_test` database and never touch dev data.
-GitHub Actions (`.github/workflows/ci.yml`) runs fmt, clippy and tests for the workspace on
-Linux, so the SocketCAN code is compiled too, and ruff, pytest against a Postgres service, and
-a Docker build for the receiver.
+GitHub Actions (`.github/workflows/ci.yml`) runs fmt, clippy, tests and `cargo doc` for the
+workspace on Linux, so the SocketCAN code is compiled too; a build with the minimum supported
+Rust (1.89); and ruff, pytest against a Postgres service, and a Docker build for the receiver.
+`[workspace.lints]` forbids `unsafe` and makes every lossy `as` cast either go away or carry a
+written reason.
 
 ## Trade-offs and what would change in production
 
@@ -229,6 +241,9 @@ a Docker build for the receiver.
   A real service would use a migration tool.
 - **Transport.** HTTP batches are simple and easy to debug. MQTT (QoS 1) would push data with
   less overhead and give a command channel back to the device.
+- **Several senders of one signal.** The aggregator keys by signal, not by source address, so
+  if two ECUs send the same PGN their values are merged. A real deployment would key by
+  `(signal, source address)` or configure the trusted sender per signal.
 - **Protocol coverage.** Five single-frame PGNs. A real tractor needs many more, multi-packet
   messages (J1939 transport protocol) and diagnostic messages (DM1).
 - **Observability.** A log line every 30 s. A fleet needs metrics shipped centrally
@@ -253,3 +268,20 @@ Things that had to be caught and corrected along the way:
   uses `AUTOINCREMENT` and a test proves it.
 - Test assumptions that did not match the real behaviour (batch sizes, timing) had to be
   rewritten to test the property, not the incidental numbers.
+- The quickstart showed that a fresh outbox restarted `seq` at 1, so the receiver dropped new
+  data as duplicates of old data. Fixed with an `outbox_id` in the dedupe key.
+
+Before handing the project over, a separate review pass (a second AI agent asked to review it
+like a senior Rust engineer, plus pedantic clippy) found more:
+
+- A replay line with a huge timestamp overflowed `SystemTime` and panicked, and a timestamp
+  after year 9999 panicked the RFC 3339 formatting in the uplink. That record stayed first in
+  the queue, so the agent crashed again after every restart.
+- A retried batch was read from the outbox again. Records appended in the meantime changed its
+  `batch_id`, and the receiver could count `dropped_records` twice. Writing the test for the
+  fix then found a second bug: the short retried batch ended the final flush early.
+- A failed uplink went unnoticed: the agent kept reading with nobody uploading.
+- Config values like `1e30` or `1e-10` seconds panicked or made the uplink spin.
+- One non-UTF-8 line ended a whole replay.
+- The token was a plain `String` inside a `Debug` struct.
+- Lossy `as` casts, now forbidden by lints unless justified.

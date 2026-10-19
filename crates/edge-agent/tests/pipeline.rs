@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use edge_agent::decode::DecodeStats;
 use edge_agent::outbox::Outbox;
 use edge_agent::pipeline::{self, PipelineConfig, Summary};
 use edge_agent::source::ReplaySource;
@@ -21,6 +20,9 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const FIXTURE: &str = include_str!("fixtures/sim-40s.log");
+const FIXTURE_FRAMES: u64 = 1711;
+/// One sample per signal and second, plus rpm min/max, over the 41 seconds of the fixture.
+const FIXTURE_SAMPLES: u64 = 325;
 const TOKEN: &str = "test-token";
 const DEVICE: &str = "test-tractor";
 const BATCH_SIZE: usize = 100;
@@ -86,17 +88,28 @@ impl FakeReceiver {
         self.stored.lock().unwrap().clone()
     }
 
-    /// Every stored seq in arrival order, duplicates included.
-    fn seqs(&self) -> Vec<i64> {
+    fn records(&self) -> Vec<Value> {
         self.batches()
             .iter()
             .flat_map(|b| b["records"].as_array().unwrap().clone())
-            .map(|r| r["seq"].as_i64().unwrap())
             .collect()
     }
 
-    /// The receiver's dedupe key without device_id, which is the same in every test.
-    fn unique_keys(&self) -> BTreeSet<(String, i64)> {
+    /// Every stored seq in arrival order, duplicates included.
+    fn seqs(&self) -> Vec<u64> {
+        self.records()
+            .iter()
+            .map(|r| r["seq"].as_u64().unwrap())
+            .collect()
+    }
+
+    fn unique_seqs(&self) -> Vec<u64> {
+        let unique: BTreeSet<u64> = self.seqs().into_iter().collect();
+        unique.into_iter().collect()
+    }
+
+    /// The receiver's dedupe key without `device_id`, which is the same in every test.
+    fn unique_keys(&self) -> BTreeSet<(String, u64)> {
         self.batches()
             .iter()
             .flat_map(|b| {
@@ -105,17 +118,9 @@ impl FakeReceiver {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .map(move |r| (outbox_id.clone(), r["seq"].as_i64().unwrap()))
+                    .map(|r| (outbox_id.clone(), r["seq"].as_u64().unwrap()))
                     .collect::<Vec<_>>()
             })
-            .collect()
-    }
-
-    fn unique_seqs(&self) -> Vec<i64> {
-        self.seqs()
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
             .collect()
     }
 }
@@ -124,7 +129,7 @@ fn config(url: &str, final_flush: Duration) -> PipelineConfig {
     PipelineConfig {
         uplink: UplinkConfig {
             url: url.to_owned(),
-            token: TOKEN.to_owned(),
+            token: TOKEN.into(),
             device_id: DEVICE.to_owned(),
             batch_size: BATCH_SIZE,
             flush_interval: Duration::from_millis(20),
@@ -167,58 +172,47 @@ fn outbox_id(path: &Path) -> String {
     Outbox::open(path, 1).unwrap().id().to_owned()
 }
 
-fn range(first: i64, last: i64) -> Vec<i64> {
+fn range(first: u64, last: u64) -> Vec<u64> {
     (first..=last).collect()
+}
+
+fn index(n: u64) -> usize {
+    usize::try_from(n).unwrap()
 }
 
 #[tokio::test]
 async fn uploads_every_sample_exactly_once() {
     let dir = TempDir::new().unwrap();
+    let outbox = dir.path().join("o.db");
     let (server, receiver) = FakeReceiver::start(|_| Behavior::Ok).await;
 
-    let outbox = dir.path().join("o.db");
     let summary = run_agent(FIXTURE, &outbox, 10_000, &server, Duration::from_secs(10)).await;
 
-    assert_eq!(summary.frames_read, 1711);
-    assert_eq!(
-        summary.decode,
-        DecodeStats {
-            frames: 1711,
-            decoded: 1694,
-            unknown_pgn: 6,
-            invalid_length: 11,
-        }
-    );
-    let n = summary.samples_written as i64;
-    assert!(n > 300, "only {n} samples from 40 s of data");
-    assert_eq!(summary.uplink.records, n as u64);
-    assert_eq!(summary.uplink.failures, 0);
+    let metrics = summary.metrics;
+    assert_eq!(metrics.frames_read, FIXTURE_FRAMES);
+    assert_eq!(metrics.unknown_pgns, 6);
+    assert_eq!(metrics.decode_errors, 11);
+    assert_eq!(metrics.samples_written, FIXTURE_SAMPLES);
+    assert_eq!(metrics.uploaded_records, FIXTURE_SAMPLES);
+    assert_eq!(metrics.upload_failures, 0);
     assert_eq!(summary.outbox_depth, 0);
-    assert_eq!(receiver.seqs(), range(1, n));
+    assert_eq!(receiver.seqs(), range(1, FIXTURE_SAMPLES));
 
-    let batches = receiver.batches();
-    for batch in &batches {
+    let id = outbox_id(&outbox);
+    for batch in receiver.batches() {
         let records = batch["records"].as_array().unwrap();
         assert!(!records.is_empty() && records.len() <= BATCH_SIZE);
         let (first, last) = (&records[0]["seq"], &records[records.len() - 1]["seq"]);
         assert_eq!(batch["batch_id"], format!("{first}-{last}"));
         assert_eq!(batch["device_id"], DEVICE);
-        assert_eq!(batch["outbox_id"], outbox_id(&outbox));
+        assert_eq!(batch["outbox_id"], id);
         assert_eq!(batch["dropped_records"], 0);
     }
 
-    let records: Vec<Value> = batches
+    let records = receiver.records();
+    let per_second: BTreeSet<(&str, &str)> = records
         .iter()
-        .flat_map(|b| b["records"].as_array().unwrap().clone())
-        .collect();
-    let per_second: BTreeSet<(String, String)> = records
-        .iter()
-        .map(|r| {
-            (
-                r["ts"].as_str().unwrap().to_owned(),
-                r["signal"].as_str().unwrap().to_owned(),
-            )
-        })
+        .map(|r| (r["ts"].as_str().unwrap(), r["signal"].as_str().unwrap()))
         .collect();
     assert_eq!(
         per_second.len(),
@@ -268,12 +262,67 @@ async fn survives_receiver_outage_without_losing_data() {
     )
     .await;
 
-    let n = summary.samples_written as i64;
-    assert_eq!(summary.uplink.failures, 7);
+    assert_eq!(summary.metrics.upload_failures, 7);
     assert_eq!(summary.outbox_depth, 0);
     // After dedupe on seq, every sample arrived. Lost responses caused resends.
-    assert_eq!(receiver.unique_seqs(), range(1, n));
-    assert!(receiver.seqs().len() > n as usize);
+    assert_eq!(receiver.unique_seqs(), range(1, FIXTURE_SAMPLES));
+    assert!(receiver.seqs().len() > index(FIXTURE_SAMPLES));
+}
+
+#[tokio::test]
+async fn a_failed_batch_is_resent_unchanged() {
+    let dir = TempDir::new().unwrap();
+    let (server, receiver) = FakeReceiver::start(|call| match call {
+        0 | 1 => Behavior::LostResponse,
+        _ => Behavior::Ok,
+    })
+    .await;
+
+    run_agent(
+        FIXTURE,
+        &dir.path().join("o.db"),
+        10_000,
+        &server,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // The writer keeps appending while the uplink backs off. A batch that was read again
+    // would have grown and got a new batch_id; the receiver would count its drops twice.
+    let batches = receiver.batches();
+    assert_eq!(batches[0], batches[1]);
+    assert_eq!(batches[1], batches[2]);
+    assert_eq!(receiver.unique_seqs(), range(1, FIXTURE_SAMPLES));
+}
+
+#[tokio::test]
+async fn shutdown_stops_reading_and_uploads_everything_read() {
+    let dir = TempDir::new().unwrap();
+    let (server, receiver) = FakeReceiver::start(|_| Behavior::Ok).await;
+    let outbox = Outbox::open(dir.path().join("o.db"), 10_000).unwrap();
+    // Realtime replay would take 40 s; the shutdown comes long before that.
+    let source = ReplaySource::new(FIXTURE.as_bytes(), true);
+    let shutdown = CancellationToken::new();
+
+    let agent = tokio::spawn(pipeline::run(
+        source,
+        outbox,
+        config(&server.uri(), Duration::from_secs(10)),
+        shutdown.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    shutdown.cancel();
+    let summary = tokio::time::timeout(Duration::from_secs(10), agent)
+        .await
+        .expect("agent did not stop")
+        .unwrap()
+        .unwrap();
+
+    let metrics = summary.metrics;
+    assert!(metrics.frames_read > 0 && metrics.frames_read < FIXTURE_FRAMES);
+    assert!(metrics.samples_written > 0);
+    assert_eq!(summary.outbox_depth, 0);
+    assert_eq!(receiver.unique_seqs(), range(1, metrics.samples_written));
 }
 
 #[tokio::test]
@@ -292,7 +341,7 @@ async fn restart_continues_seq_without_gaps_or_reuse() {
         Duration::from_secs(10),
     )
     .await;
-    let n1 = run1.samples_written as i64;
+    let n1 = run1.metrics.samples_written;
     assert_eq!(run1.outbox_depth, 0);
     assert_eq!(before.seqs(), range(1, n1));
 
@@ -306,9 +355,9 @@ async fn restart_continues_seq_without_gaps_or_reuse() {
         Duration::from_millis(200),
     )
     .await;
-    let n2 = run2.samples_written as i64;
-    assert_eq!(run2.uplink.records, 0);
-    assert_eq!(run2.outbox_depth, n2 as u64);
+    let n2 = run2.metrics.samples_written;
+    assert_eq!(run2.metrics.uploaded_records, 0);
+    assert_eq!(run2.outbox_depth, n2);
 
     // Run 3: network back, no new input. The leftovers go out with the next seqs.
     let (server, after) = FakeReceiver::start(|_| Behavior::Ok).await;
@@ -348,16 +397,15 @@ async fn fresh_outbox_after_deleted_file_is_not_deduped_away() {
         Duration::from_secs(10),
     )
     .await;
-    let second_id = outbox_id(&outbox);
-    assert_ne!(first_id, second_id);
+    assert_ne!(first_id, outbox_id(&outbox));
 
-    let (n1, n2) = (run1.samples_written as i64, run2.samples_written as i64);
+    let (n1, n2) = (run1.metrics.samples_written, run2.metrics.samples_written);
     let seqs = receiver.seqs();
-    assert_eq!(seqs[..n1 as usize], range(1, n1));
-    assert_eq!(seqs[n1 as usize..], range(1, n2));
+    assert_eq!(seqs[..index(n1)], range(1, n1));
+    assert_eq!(seqs[index(n1)..], range(1, n2));
     // Deduped on seq alone, the second run would collide with the first one.
-    assert!(receiver.unique_seqs().len() < (n1 + n2) as usize);
-    assert_eq!(receiver.unique_keys().len(), (n1 + n2) as usize);
+    assert!(receiver.unique_seqs().len() < index(n1 + n2));
+    assert_eq!(receiver.unique_keys().len(), index(n1 + n2));
 }
 
 #[tokio::test]
@@ -368,15 +416,15 @@ async fn full_outbox_drops_oldest_and_reports_it() {
 
     let (server, _down) = FakeReceiver::start(|_| Behavior::Unavailable).await;
     let offline = run_agent(FIXTURE, &outbox, cap, &server, Duration::from_millis(200)).await;
-    let n = offline.samples_written as i64;
+    let n = offline.metrics.samples_written;
     assert_eq!(offline.outbox_depth, cap);
 
     let (server, receiver) = FakeReceiver::start(|_| Behavior::Ok).await;
     run_agent("", &outbox, cap, &server, Duration::from_secs(10)).await;
 
-    assert_eq!(receiver.seqs(), range(n - cap as i64 + 1, n));
+    assert_eq!(receiver.seqs(), range(n - cap + 1, n));
     let batches = receiver.batches();
-    assert_eq!(batches[0]["dropped_records"], n - cap as i64);
+    assert_eq!(batches[0]["dropped_records"], n - cap);
     assert!(batches[1..].iter().all(|b| b["dropped_records"] == 0));
 
     let reopened = Outbox::open(&outbox, cap).unwrap();

@@ -44,6 +44,8 @@ ORDER BY signal, ts DESC, seq DESC
 def create_app(database_url: str | None = None, token: str | None = None) -> FastAPI:
     database_url = database_url or os.environ["DATABASE_URL"]
     token = token or os.environ["RECEIVER_TOKEN"]
+    if not token.strip():
+        raise RuntimeError("RECEIVER_TOKEN must not be empty")
     pool = ConnectionPool(database_url, open=False)
 
     @asynccontextmanager

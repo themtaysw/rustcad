@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -5,31 +6,37 @@ use std::time::Duration;
 use j1939::DecodeError;
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::aggregate::{Aggregator, Sample};
-use crate::decode::{DecodeStats, Reading, decode_frame};
+use crate::decode::{Reading, decode_frame};
 use crate::frame::Frame;
-use crate::metrics::{self, Metrics};
+use crate::metrics::{self, Metrics, Snapshot};
 use crate::outbox::{Outbox, OutboxError, OutboxHandle};
 use crate::source::FrameSource;
-use crate::uplink::{Uplink, UplinkConfig, UplinkStats};
+use crate::uplink::{Uplink, UplinkConfig};
 
 const CHANNEL_CAPACITY: usize = 1024;
 /// Close the current aggregation bucket if no reading arrives for this long (bus went quiet).
 const IDLE_FLUSH: Duration = Duration::from_secs(2);
 /// Upper bound of samples written to SQLite in one transaction.
 const WRITE_CHUNK: usize = 512;
+/// A broken sender can produce bad frames at bus speed. Only the first ones are logged
+/// one by one; after that the health line's `decode_errors` counter tells the story.
+const LOGGED_DECODE_ERRORS: u64 = 20;
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
     #[error("reading frames failed: {0}")]
-    Source(#[from] io::Error),
-    #[error(transparent)]
-    Outbox(#[from] OutboxError),
-    #[error("cannot create HTTP client: {0}")]
-    Http(#[from] reqwest::Error),
+    Source(#[source] io::Error),
+    #[error("writing to the outbox failed: {0}")]
+    Writer(#[source] OutboxError),
+    #[error("uploading from the outbox failed: {0}")]
+    Uplink(#[source] OutboxError),
+    #[error("cannot create the HTTP client: {0}")]
+    HttpClient(#[source] reqwest::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -38,20 +45,27 @@ pub struct PipelineConfig {
     pub health_interval: Duration,
 }
 
-#[derive(Debug)]
+/// Counters at the end of the run, plus what is still waiting in the outbox.
+#[derive(Debug, Clone, Copy)]
 pub struct Summary {
-    pub frames_read: u64,
-    pub decode: DecodeStats,
-    pub samples_written: u64,
-    pub uplink: UplinkStats,
+    pub metrics: Snapshot,
     pub outbox_depth: u64,
 }
 
-/// Runs reader -> decoder -> aggregator -> outbox writer, plus the uplink task.
+/// Runs reader -> decoder -> aggregator -> outbox writer, plus the uplink and health tasks.
 ///
-/// Stops when the source is exhausted or `shutdown` is cancelled. Either way every stage
-/// drains its input in order, so all readings end up in the outbox, and then the uplink
-/// makes a final attempt to upload what is left.
+/// Stops when the source is exhausted, when `shutdown` is cancelled, or when a stage fails
+/// (which cancels `shutdown`). Every stage then drains its input in order, so all readings
+/// reach the outbox, and the uplink makes a final attempt to upload what is left.
+///
+/// # Errors
+///
+/// The first error of the source, the outbox writer or the uplink. The pipeline is
+/// drained and stopped either way.
+///
+/// # Panics
+///
+/// Re-raises a panic from any of its tasks.
 pub async fn run<S>(
     source: S,
     outbox: Outbox,
@@ -70,7 +84,8 @@ where
         outbox.clone(),
         Arc::clone(&work_waiting),
         Arc::clone(&metrics),
-    )?;
+    )
+    .map_err(PipelineError::HttpClient)?;
     let uplink_shutdown = CancellationToken::new();
     let health_stop = CancellationToken::new();
 
@@ -84,77 +99,104 @@ where
         config.health_interval,
         health_stop.clone(),
     ));
-    let reader = tokio::spawn(read_frames(
-        source,
-        frame_tx,
-        shutdown,
-        Arc::clone(&metrics),
-    ));
+    let reader = spawn_stage(
+        &shutdown,
+        read_frames(source, frame_tx, shutdown.clone(), Arc::clone(&metrics)),
+    );
     let decoder = tokio::spawn(decode_frames(frame_rx, reading_tx, Arc::clone(&metrics)));
     let aggregator = tokio::spawn(aggregate(reading_rx, sample_tx, IDLE_FLUSH));
-    let writer = tokio::spawn(write_samples(
-        sample_rx,
-        outbox.clone(),
-        work_waiting,
-        batch_size,
-        Arc::clone(&metrics),
-    ));
-    let uplink = tokio::spawn(uplink.run(uplink_shutdown.clone()));
+    let writer = spawn_stage(
+        &shutdown,
+        write_samples(
+            sample_rx,
+            outbox.clone(),
+            work_waiting,
+            batch_size,
+            Arc::clone(&metrics),
+        ),
+    );
+    let uplink = spawn_stage(&shutdown, uplink.run(uplink_shutdown.clone()));
 
-    // A JoinError means a task panicked, which is a bug, so it is not turned into a PipelineError.
-    let frames_read = reader.await.expect("reader task panicked");
-    let decode = decoder.await.expect("decoder task panicked");
-    aggregator.await.expect("aggregator task panicked");
-    let samples_written = writer.await.expect("writer task panicked");
+    let read = join(reader).await;
+    join(decoder).await;
+    join(aggregator).await;
+    let written = join(writer).await;
     // Everything that will ever reach the outbox is there now.
     uplink_shutdown.cancel();
-    let uplink = uplink.await.expect("uplink task panicked");
+    let uploaded = join(uplink).await;
     health_stop.cancel();
-    health.await.expect("health task panicked");
+    join(health).await;
 
+    read.map_err(PipelineError::Source)?;
+    written.map_err(PipelineError::Writer)?;
+    uploaded.map_err(PipelineError::Uplink)?;
     Ok(Summary {
-        frames_read: frames_read?,
-        decode,
-        samples_written: samples_written?,
-        uplink: uplink?,
-        outbox_depth: outbox.depth().await,
+        metrics: metrics.snapshot(),
+        outbox_depth: outbox.depth(),
     })
 }
 
-pub async fn read_frames<S: FrameSource>(
+/// Spawns a stage that can fail. A failure cancels `shutdown`, so the whole pipeline
+/// stops instead of running on with a dead stage (e.g. reading but never uploading).
+fn spawn_stage<T, E>(
+    shutdown: &CancellationToken,
+    stage: impl Future<Output = Result<T, E>> + Send + 'static,
+) -> JoinHandle<Result<T, E>>
+where
+    T: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let result = stage.await;
+        if let Err(e) = &result {
+            error!(error = %e, "pipeline stage failed, shutting down");
+            shutdown.cancel();
+        }
+        result
+    })
+}
+
+/// Waits for a task and re-raises its panic with the original payload.
+async fn join<T>(task: JoinHandle<T>) -> T {
+    match task.await {
+        Ok(value) => value,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => unreachable!("pipeline tasks are never aborted: {e}"),
+    }
+}
+
+pub(crate) async fn read_frames<S: FrameSource>(
     mut source: S,
     tx: mpsc::Sender<Frame>,
     shutdown: CancellationToken,
     metrics: Arc<Metrics>,
-) -> io::Result<u64> {
-    let mut count = 0;
+) -> io::Result<()> {
     loop {
         let frame = tokio::select! {
-            _ = shutdown.cancelled() => break,
+            () = shutdown.cancelled() => break,
             frame = source.next_frame() => frame?,
         };
         let Some(frame) = frame else { break };
+        metrics.add_frame();
         if tx.send(frame).await.is_err() {
             break;
         }
-        count += 1;
-        metrics.add_frame();
     }
-    Ok(count)
+    Ok(())
 }
 
-pub async fn decode_frames(
+pub(crate) async fn decode_frames(
     mut rx: mpsc::Receiver<Frame>,
     tx: mpsc::Sender<Reading>,
     metrics: Arc<Metrics>,
-) -> DecodeStats {
-    let mut stats = DecodeStats::default();
+) {
     while let Some(frame) = rx.recv().await {
-        match decode_frame(&frame, &mut stats) {
+        match decode_frame(&frame) {
             Ok(readings) => {
                 for reading in readings {
                     if tx.send(reading).await.is_err() {
-                        return stats;
+                        return;
                     }
                 }
             }
@@ -163,15 +205,19 @@ pub async fn decode_frames(
                 debug!(id = format_args!("{:08X}", frame.id), error = %e, "skipping frame");
             }
             Err(e @ DecodeError::InvalidLength { .. }) => {
-                metrics.add_decode_error();
-                warn!(id = format_args!("{:08X}", frame.id), error = %e, "skipping frame");
+                let count = metrics.add_decode_error();
+                if count <= LOGGED_DECODE_ERRORS {
+                    warn!(id = format_args!("{:08X}", frame.id), error = %e, "skipping frame");
+                }
+                if count == LOGGED_DECODE_ERRORS {
+                    warn!("further decode errors are only counted in the health log");
+                }
             }
         }
     }
-    stats
 }
 
-pub async fn aggregate(
+pub(crate) async fn aggregate(
     mut rx: mpsc::Receiver<Reading>,
     tx: mpsc::Sender<Sample>,
     idle_flush: Duration,
@@ -198,14 +244,13 @@ pub async fn aggregate(
 }
 
 /// Writes samples to the outbox, grouping whatever is already queued into one transaction.
-pub async fn write_samples(
+pub(crate) async fn write_samples(
     mut rx: mpsc::Receiver<Sample>,
     outbox: OutboxHandle,
     work_waiting: Arc<Notify>,
     batch_size: usize,
     metrics: Arc<Metrics>,
-) -> Result<u64, OutboxError> {
-    let mut written = 0;
+) -> Result<(), OutboxError> {
     while let Some(first) = rx.recv().await {
         let mut samples = vec![first];
         while samples.len() < WRITE_CHUNK {
@@ -214,14 +259,14 @@ pub async fn write_samples(
                 Err(_) => break,
             }
         }
-        let n = samples.len() as u64;
-        written += n;
-        metrics.add_samples(n);
-        if outbox.append(samples).await? >= batch_size as u64 {
+        let count = samples.len() as u64;
+        let depth = outbox.append(samples).await?;
+        metrics.add_samples(count);
+        if depth >= batch_size as u64 {
             work_waiting.notify_one();
         }
     }
-    Ok(written)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -239,6 +284,24 @@ mod tests {
             signal: Signal::CoolantTempC,
             value,
         }
+    }
+
+    #[tokio::test]
+    async fn a_failing_stage_cancels_the_pipeline() {
+        let shutdown = CancellationToken::new();
+        let ok = spawn_stage(&shutdown, async { Ok::<_, String>(()) });
+        assert_eq!(join(ok).await, Ok(()));
+        assert!(!shutdown.is_cancelled());
+
+        let failed = spawn_stage(&shutdown, async { Err::<(), _>("disk full".to_owned()) });
+        assert!(join(failed).await.is_err());
+        assert!(shutdown.is_cancelled());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "stage bug")]
+    async fn join_re_raises_the_original_panic() {
+        join(tokio::spawn(async { panic!("stage bug") })).await;
     }
 
     #[tokio::test(start_paused = true)]

@@ -1,10 +1,14 @@
 const PDU2_MIN_PF: u32 = 240;
 const GLOBAL_ADDRESS: u8 = 0xFF;
 
+/// The parts of a 29-bit J1939 CAN identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanId {
+    /// 0 (highest) to 7 (lowest).
     pub priority: u8,
+    /// Parameter group number, 18 bits including the data page bits.
     pub pgn: u32,
+    /// Address of the sender.
     pub source_address: u8,
     /// `Some` only for PDU1 messages, where PS is the destination address.
     pub destination_address: Option<u8>,
@@ -12,6 +16,7 @@ pub struct CanId {
 
 impl CanId {
     /// Parses a 29-bit extended CAN ID. Bits above bit 28 are ignored.
+    #[must_use]
     pub fn from_raw(raw: u32) -> Self {
         let priority = ((raw >> 26) & 0x7) as u8;
         let data_page = (raw >> 24) & 0x3;
@@ -33,7 +38,10 @@ impl CanId {
         }
     }
 
-    /// Builds the 29-bit CAN ID. A PDU1 message without a destination goes to the global address.
+    /// Builds the 29-bit CAN ID. A PDU1 message without a destination goes to the global
+    /// address. Out-of-range fields are masked: only the low 3 bits of `priority` and the
+    /// low 18 bits of `pgn` are used.
+    #[must_use]
     pub fn to_raw(&self) -> u32 {
         let pgn = self.pgn & 0x3_FFFF;
         let pf = (pgn >> 8) & 0xFF;

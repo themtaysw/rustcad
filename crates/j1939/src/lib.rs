@@ -2,6 +2,8 @@
 //!
 //! Pure library, no IO.
 
+#![warn(missing_docs)]
+
 mod id;
 mod message;
 mod pgn;

@@ -142,18 +142,28 @@ mod tests {
 
     use super::*;
 
-    fn run(tractor: &mut Tractor, seconds: f64) {
+    const DT: f64 = 0.05;
+    const STEPS_PER_SEC: u32 = 20;
+    /// `WARMUP_S` in whole seconds, for loop counts.
+    const WARMUP: u32 = 30;
+
+    #[test]
+    fn test_constants_match_the_model() {
+        assert_eq!(f64::from(WARMUP), WARMUP_S);
+        assert_eq!(DT * f64::from(STEPS_PER_SEC), 1.0);
+    }
+
+    fn run(tractor: &mut Tractor, seconds: u32) {
         let mut rng = StdRng::seed_from_u64(7);
-        let dt = 0.05;
-        for _ in 0..(seconds / dt) as usize {
-            tractor.step(dt, &mut rng);
+        for _ in 0..seconds * STEPS_PER_SEC {
+            tractor.step(DT, &mut rng);
         }
     }
 
     #[test]
     fn idles_in_place_while_warming_up() {
         let mut tractor = Tractor::default();
-        run(&mut tractor, WARMUP_S - 1.0);
+        run(&mut tractor, WARMUP - 1);
 
         assert_eq!(tractor.speed_kmh, 0.0);
         assert_eq!(tractor.distance_m, 0.0);
@@ -165,7 +175,7 @@ mod tests {
     #[test]
     fn works_the_field_after_warmup() {
         let mut tractor = Tractor::default();
-        run(&mut tractor, WARMUP_S + 30.0);
+        run(&mut tractor, WARMUP + 30);
 
         assert!(
             (9.0..11.0).contains(&tractor.speed_kmh),
@@ -182,8 +192,8 @@ mod tests {
         let mut tractor = Tractor::default();
         let mut rng = StdRng::seed_from_u64(7);
         let mut headland_speeds = Vec::new();
-        for _ in 0..(400.0 / 0.05) as usize {
-            tractor.step(0.05, &mut rng);
+        for _ in 0..400 * STEPS_PER_SEC {
+            tractor.step(DT, &mut rng);
             if field::locate(tractor.distance_m).on_headland {
                 headland_speeds.push(tractor.speed_kmh);
             }
@@ -196,7 +206,7 @@ mod tests {
     #[test]
     fn coolant_settles_near_thermostat() {
         let mut tractor = Tractor::default();
-        run(&mut tractor, 600.0);
+        run(&mut tractor, 600);
         assert!(
             (85.0..96.0).contains(&tractor.coolant_c),
             "{}",
@@ -207,7 +217,7 @@ mod tests {
     #[test]
     fn messages_round_trip_through_j1939() {
         let mut tractor = Tractor::default();
-        run(&mut tractor, WARMUP_S + 10.0);
+        run(&mut tractor, WARMUP + 10);
 
         let rpm = Eec1::decode(&tractor.eec1().encode())
             .engine_speed_rpm

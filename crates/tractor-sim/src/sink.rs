@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,8 +40,12 @@ impl<W: Write> FrameSink for LogSink<W> {
 }
 
 fn format_frame(iface: &str, frame: &Frame) -> String {
-    let data: String = frame.data.iter().map(|b| format!("{b:02X}")).collect();
-    format!("{iface} {:08X}#{data}", frame.id)
+    let mut line = format!("{iface} {:08X}#", frame.id);
+    for byte in &frame.data {
+        // Writing to a String cannot fail.
+        let _ = write!(line, "{byte:02X}");
+    }
+    line
 }
 
 #[cfg(target_os = "linux")]

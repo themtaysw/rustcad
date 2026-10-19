@@ -16,6 +16,7 @@ pub enum Signal {
 }
 
 impl Signal {
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Signal::EngineSpeedRpm => "engine_speed_rpm",
@@ -43,30 +44,14 @@ pub struct Reading {
     pub value: f64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DecodeStats {
-    pub frames: u64,
-    pub decoded: u64,
-    pub unknown_pgn: u64,
-    pub invalid_length: u64,
-}
-
-impl DecodeStats {
-    pub fn errors(&self) -> u64 {
-        self.unknown_pgn + self.invalid_length
-    }
-}
-
-/// Decodes a frame into zero or more readings and counts the outcome in `stats`.
-pub fn decode_frame(frame: &Frame, stats: &mut DecodeStats) -> Result<Vec<Reading>, DecodeError> {
-    stats.frames += 1;
+/// Decodes a frame into zero or more readings.
+///
+/// # Errors
+///
+/// Passes on [`DecodeError`] for unknown PGNs and wrong payload lengths.
+pub fn decode_frame(frame: &Frame) -> Result<Vec<Reading>, DecodeError> {
     let id = CanId::from_raw(frame.id);
-
-    let message = j1939::decode(id.pgn, &frame.data).inspect_err(|e| match e {
-        DecodeError::UnknownPgn(_) => stats.unknown_pgn += 1,
-        DecodeError::InvalidLength { .. } => stats.invalid_length += 1,
-    })?;
-    stats.decoded += 1;
+    let message = j1939::decode(id.pgn, &frame.data)?;
 
     let reading = |signal, value: Option<f64>| {
         value.map(|value| Reading {
@@ -105,14 +90,10 @@ mod tests {
 
     #[test]
     fn decodes_engine_speed() {
-        let mut stats = DecodeStats::default();
-        let readings = decode_frame(
-            &frame(
-                0x0CF0_0417,
-                &[0xFF, 0xFF, 0xFF, 0xE0, 0x2E, 0xFF, 0xFF, 0xFF],
-            ),
-            &mut stats,
-        )
+        let readings = decode_frame(&frame(
+            0x0CF0_0417,
+            &[0xFF, 0xFF, 0xFF, 0xE0, 0x2E, 0xFF, 0xFF, 0xFF],
+        ))
         .unwrap();
         assert_eq!(
             readings,
@@ -123,26 +104,14 @@ mod tests {
                 value: 1500.0,
             }]
         );
-        assert_eq!(
-            stats,
-            DecodeStats {
-                frames: 1,
-                decoded: 1,
-                ..Default::default()
-            }
-        );
     }
 
     #[test]
     fn position_gives_two_readings() {
-        let mut stats = DecodeStats::default();
-        let readings = decode_frame(
-            &frame(
-                0x18FE_F300,
-                &[0x18, 0x45, 0xA8, 0x9A, 0xB0, 0x82, 0x5E, 0x87],
-            ),
-            &mut stats,
-        )
+        let readings = decode_frame(&frame(
+            0x18FE_F300,
+            &[0x18, 0x45, 0xA8, 0x9A, 0xB0, 0x82, 0x5E, 0x87],
+        ))
         .unwrap();
         let signals: Vec<Signal> = readings.iter().map(|r| r.signal).collect();
         assert_eq!(signals, [Signal::LatitudeDeg, Signal::LongitudeDeg]);
@@ -150,26 +119,21 @@ mod tests {
 
     #[test]
     fn not_available_is_decoded_but_gives_no_readings() {
-        let mut stats = DecodeStats::default();
-        let readings = decode_frame(&frame(0x18FE_F300, &[0xFF; 8]), &mut stats).unwrap();
-        assert!(readings.is_empty());
-        assert_eq!(stats.decoded, 1);
-        assert_eq!(stats.errors(), 0);
+        assert_eq!(decode_frame(&frame(0x18FE_F300, &[0xFF; 8])), Ok(vec![]));
     }
 
     #[test]
-    fn counts_errors() {
-        let mut stats = DecodeStats::default();
-        assert!(decode_frame(&frame(0x18FF_1200, &[0; 8]), &mut stats).is_err());
-        assert!(decode_frame(&frame(0x0CF0_0400, &[0xFF; 3]), &mut stats).is_err());
+    fn passes_on_decode_errors() {
         assert_eq!(
-            stats,
-            DecodeStats {
-                frames: 2,
-                decoded: 0,
-                unknown_pgn: 1,
-                invalid_length: 1,
-            }
+            decode_frame(&frame(0x18FF_1200, &[0; 8])),
+            Err(DecodeError::UnknownPgn(0xFF12))
+        );
+        assert_eq!(
+            decode_frame(&frame(0x0CF0_0400, &[0xFF; 3])),
+            Err(DecodeError::InvalidLength {
+                pgn: 0xF004,
+                len: 3
+            })
         );
     }
 }

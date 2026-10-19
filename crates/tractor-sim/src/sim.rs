@@ -9,6 +9,19 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
+/// Number of ticks in `secs`, at least one.
+///
+/// Callers pass a positive, validated rate (at most 1000 Hz) and a positive duration, so
+/// the result is a small whole number; `as` would saturate rather than wrap anyway.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "inputs are validated positive and bounded, see above"
+)]
+pub fn ticks(secs: f64, rate_hz: f64) -> u64 {
+    ((secs * rate_hz).round() as u64).max(1)
+}
+
 struct Entry {
     pgn: u32,
     priority: u8,
@@ -31,7 +44,6 @@ impl<R: Rng> Simulator<R> {
     /// EEC1 is sent on every tick. The other PGNs use J1939-71 style fixed periods,
     /// but never faster than one tick.
     pub fn new(rate_hz: f64, source_address: u8, garbage_rate: f64, rng: R) -> Self {
-        let every = |period_s: f64| ((period_s * rate_hz).round() as u64).max(1);
         let entries = vec![
             Entry {
                 pgn: Eec1::PGN,
@@ -42,25 +54,25 @@ impl<R: Rng> Simulator<R> {
             Entry {
                 pgn: Ccvs::PGN,
                 priority: 6,
-                every_ticks: every(0.1),
+                every_ticks: ticks(0.1, rate_hz),
                 build: |t| Message::Ccvs(t.ccvs()),
             },
             Entry {
                 pgn: Lfe::PGN,
                 priority: 6,
-                every_ticks: every(0.1),
+                every_ticks: ticks(0.1, rate_hz),
                 build: |t| Message::Lfe(t.lfe()),
             },
             Entry {
                 pgn: Et1::PGN,
                 priority: 6,
-                every_ticks: every(1.0),
+                every_ticks: ticks(1.0, rate_hz),
                 build: |t| Message::Et1(t.et1()),
             },
             Entry {
                 pgn: VehiclePosition::PGN,
                 priority: 6,
-                every_ticks: every(1.0),
+                every_ticks: ticks(1.0, rate_hz),
                 build: |t| Message::VehiclePosition(t.position()),
             },
         ];
@@ -164,6 +176,14 @@ mod tests {
                 .filter(|f| CanId::from_raw(f.id).pgn == pgn)
                 .count()
         })
+    }
+
+    #[test]
+    fn ticks_rounds_and_never_returns_zero() {
+        assert_eq!(ticks(0.1, 20.0), 2);
+        assert_eq!(ticks(1.0, 20.0), 20);
+        assert_eq!(ticks(0.1, 2.0), 1);
+        assert_eq!(ticks(0.001, 20.0), 1);
     }
 
     #[test]

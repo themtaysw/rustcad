@@ -2,24 +2,40 @@ use thiserror::Error;
 
 use crate::pgn::{Ccvs, Eec1, Et1, Lfe, VehiclePosition};
 
+/// Why a payload could not be decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DecodeError {
+    /// The PGN is not one this crate decodes. Normal on a real bus.
     #[error("unknown PGN {0} ({0:#06X})")]
     UnknownPgn(u32),
+    /// A known PGN with a payload that is not exactly 8 bytes.
     #[error("PGN {pgn}: expected 8 data bytes, got {len}")]
-    InvalidLength { pgn: u32, len: usize },
+    InvalidLength {
+        /// The PGN of the frame.
+        pgn: u32,
+        /// The number of data bytes received.
+        len: usize,
+    },
 }
 
+/// A decoded message of one of the supported PGNs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Message {
+    /// Electronic Engine Controller 1.
     Eec1(Eec1),
+    /// Engine Temperature 1.
     Et1(Et1),
+    /// Fuel Economy (Liquid).
     Lfe(Lfe),
+    /// Cruise Control / Vehicle Speed.
     Ccvs(Ccvs),
+    /// Vehicle Position.
     VehiclePosition(VehiclePosition),
 }
 
 impl Message {
+    /// The PGN this message is sent with.
+    #[must_use]
     pub fn pgn(&self) -> u32 {
         match self {
             Message::Eec1(_) => Eec1::PGN,
@@ -30,6 +46,8 @@ impl Message {
         }
     }
 
+    /// The 8-byte payload, with "not available" for every `None` signal.
+    #[must_use]
     pub fn encode(&self) -> [u8; 8] {
         match self {
             Message::Eec1(m) => m.encode(),
@@ -41,6 +59,12 @@ impl Message {
     }
 }
 
+/// Decodes the payload of a frame with the given PGN.
+///
+/// # Errors
+///
+/// [`DecodeError::UnknownPgn`] for PGNs this crate does not know, checked first, and
+/// [`DecodeError::InvalidLength`] if the payload is not exactly 8 bytes.
 pub fn decode(pgn: u32, data: &[u8]) -> Result<Message, DecodeError> {
     let message = match pgn {
         Eec1::PGN => Message::Eec1(Eec1::decode(payload(pgn, data)?)),

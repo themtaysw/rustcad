@@ -44,54 +44,86 @@ async fn main() -> Result<()> {
     let config = Config::load(args.config.as_deref(), |name| std::env::var(name).ok())?;
     info!(?config, "starting");
 
+    let signals = Signals::new().context("cannot listen for SIGINT/SIGTERM")?;
     let shutdown = CancellationToken::new();
-    tokio::spawn(stop_on_signal(shutdown.clone()));
+    tokio::spawn(stop_on_signal(signals, shutdown.clone()));
 
-    let summary = run(&args, &config, shutdown).await?;
+    let Summary {
+        metrics,
+        outbox_depth,
+    } = run(&args, &config, shutdown).await?;
     info!(
-        frames = summary.frames_read,
-        decoded = summary.decode.decoded,
-        unknown_pgn = summary.decode.unknown_pgn,
-        invalid_length = summary.decode.invalid_length,
-        samples = summary.samples_written,
-        uploaded_records = summary.uplink.records,
-        upload_failures = summary.uplink.failures,
-        outbox_depth = summary.outbox_depth,
+        frames = metrics.frames_read,
+        unknown_pgns = metrics.unknown_pgns,
+        decode_errors = metrics.decode_errors,
+        samples = metrics.samples_written,
+        uploaded_records = metrics.uploaded_records,
+        upload_failures = metrics.upload_failures,
+        outbox_depth,
         "stopped"
     );
     Ok(())
 }
 
 /// The first SIGTERM or SIGINT stops reading and lets the pipeline drain and upload.
-/// A second one exits at once.
-async fn stop_on_signal(shutdown: CancellationToken) {
-    let signal = wait_for_signal().await;
+/// A second one exits at once, with the usual 128 + signal number exit code.
+async fn stop_on_signal(mut signals: Signals, shutdown: CancellationToken) {
+    let (name, _) = signals.recv().await;
     info!(
-        signal,
+        signal = name,
         "shutting down, send the signal again to exit immediately"
     );
     shutdown.cancel();
 
-    let signal = wait_for_signal().await;
-    warn!(signal, "exiting without final upload");
-    std::process::exit(130);
+    let (name, exit_code) = signals.recv().await;
+    warn!(signal = name, "exiting without final upload");
+    std::process::exit(exit_code);
+}
+
+/// Signal handlers registered once at startup, so a second signal never hits the default
+/// handler in a gap between two registrations.
+#[cfg(unix)]
+struct Signals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
-async fn wait_for_signal() -> &'static str {
-    use tokio::signal::unix::{SignalKind, signal};
+impl Signals {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
 
-    let mut terminate = signal(SignalKind::terminate()).expect("cannot listen for SIGTERM");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => "SIGINT",
-        _ = terminate.recv() => "SIGTERM",
+    /// Name and exit code of the next signal.
+    async fn recv(&mut self) -> (&'static str, i32) {
+        tokio::select! {
+            _ = self.interrupt.recv() => ("SIGINT", 130),
+            _ = self.terminate.recv() => ("SIGTERM", 143),
+        }
     }
 }
 
 #[cfg(not(unix))]
-async fn wait_for_signal() -> &'static str {
-    let _ = tokio::signal::ctrl_c().await;
-    "Ctrl-C"
+struct Signals;
+
+#[cfg(not(unix))]
+impl Signals {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "same signature as the Unix version"
+    )]
+    fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) -> (&'static str, i32) {
+        let _ = tokio::signal::ctrl_c().await;
+        ("Ctrl-C", 130)
+    }
 }
 
 async fn run(args: &Args, config: &Config, shutdown: CancellationToken) -> Result<Summary> {
@@ -125,6 +157,7 @@ async fn run_live(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[expect(clippy::unused_async, reason = "same signature as the Linux version")]
 async fn run_live(
     _iface: &str,
     _outbox: Outbox,

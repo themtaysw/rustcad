@@ -1,16 +1,20 @@
 [package]
 name = "edge-agent"
+description = "Edge agent: J1939 from CAN to a SQLite outbox to an HTTP receiver"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+anyhow.workspace = true
+clap.workspace = true
 humantime = "2"
-j1939 = { path = "../j1939" }
-rand = "0.9"
+j1939.workspace = true
+rand.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 serde = { version = "1", features = ["derive"] }
 thiserror.workspace = true
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
@@ -21,10 +25,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-socketcan = { version = "3", features = ["tokio"] }
+socketcan = { workspace = true, features = ["tokio"] }
 
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 wiremock = "0.6"
+
+[lints]
+workspace = true

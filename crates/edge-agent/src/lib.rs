@@ -8,5 +8,6 @@ pub mod frame;
 pub mod metrics;
 pub mod outbox;
 pub mod pipeline;
+pub mod secret;
 pub mod source;
 pub mod uplink;

@@ -2,13 +2,16 @@ use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 use tracing::warn;
 
 use super::FrameSource;
-use crate::frame::Frame;
+use crate::frame::{Frame, timestamp_in_range};
 
 const MAX_EXTENDED_ID: u32 = 0x1FFF_FFFF;
+/// A candump line is about 60 bytes. Anything much longer is not one and is skipped
+/// without buffering all of it.
+const MAX_LINE_BYTES: u64 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ParseError {
@@ -22,10 +25,18 @@ pub enum ParseError {
     Data,
     #[error("CAN FD and remote frames are not supported")]
     Unsupported,
+    #[error("line is not UTF-8")]
+    Encoding,
+    #[error("line is longer than {MAX_LINE_BYTES} bytes")]
+    TooLong,
 }
 
 /// Parses one line of `candump -l` / `candump -L` output, e.g.
 /// `(1700000000.123456) vcan0 0CF00400#FFFFFFE02EFFFFFF`.
+///
+/// # Errors
+///
+/// Returns which part of the line is malformed.
 pub fn parse_line(line: &str) -> Result<Frame, ParseError> {
     let mut parts = line.split_whitespace();
     let (Some(timestamp), Some(_iface), Some(frame), None) =
@@ -47,24 +58,35 @@ pub fn parse_line(line: &str) -> Result<Frame, ParseError> {
     })
 }
 
+fn is_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_hex(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn parse_timestamp(s: &str) -> Result<SystemTime, ParseError> {
     let inner = s
         .strip_prefix('(')
         .and_then(|s| s.strip_suffix(')'))
         .ok_or(ParseError::Timestamp)?;
     let (secs, frac) = inner.split_once('.').ok_or(ParseError::Timestamp)?;
-    if frac.is_empty() || frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+    if !is_digits(secs) || !is_digits(frac) || frac.len() > 9 {
         return Err(ParseError::Timestamp);
     }
     let secs: u64 = secs.parse().map_err(|_| ParseError::Timestamp)?;
     let nanos: u32 = format!("{frac:0<9}")
         .parse()
         .map_err(|_| ParseError::Timestamp)?;
-    Ok(UNIX_EPOCH + Duration::new(secs, nanos))
+    UNIX_EPOCH
+        .checked_add(Duration::new(secs, nanos))
+        .filter(|&ts| timestamp_in_range(ts))
+        .ok_or(ParseError::Timestamp)
 }
 
 fn parse_id(s: &str) -> Result<u32, ParseError> {
-    if s.len() != 8 {
+    if s.len() != 8 || !is_hex(s) {
         return Err(ParseError::Id);
     }
     let id = u32::from_str_radix(s, 16).map_err(|_| ParseError::Id)?;
@@ -75,7 +97,7 @@ fn parse_id(s: &str) -> Result<u32, ParseError> {
 }
 
 fn parse_data(s: &str) -> Result<Vec<u8>, ParseError> {
-    if !s.len().is_multiple_of(2) || s.len() > 16 || !s.is_ascii() {
+    if !s.len().is_multiple_of(2) || s.len() > 16 || !is_hex(s) {
         return Err(ParseError::Data);
     }
     (0..s.len())
@@ -85,13 +107,14 @@ fn parse_data(s: &str) -> Result<Vec<u8>, ParseError> {
 }
 
 /// Reads frames from a candump log. Broken lines are logged and skipped.
+#[derive(Debug)]
 pub struct ReplaySource<R> {
     reader: R,
-    line: String,
+    line: Vec<u8>,
     line_number: u64,
     realtime: bool,
     previous: Option<SystemTime>,
-    pub skipped_lines: u64,
+    skipped_lines: u64,
 }
 
 impl<R> ReplaySource<R> {
@@ -100,38 +123,88 @@ impl<R> ReplaySource<R> {
     pub fn new(reader: R, realtime: bool) -> Self {
         Self {
             reader,
-            line: String::new(),
+            line: Vec::new(),
             line_number: 0,
             realtime,
             previous: None,
             skipped_lines: 0,
         }
     }
+
+    /// Lines that were not valid candump frames.
+    #[must_use]
+    pub fn skipped_lines(&self) -> u64 {
+        self.skipped_lines
+    }
+}
+
+impl<R: AsyncBufRead + Unpin + Send> ReplaySource<R> {
+    /// Reads the next line into `self.line`, at most [`MAX_LINE_BYTES`] of it.
+    /// `Ok(None)` at end of input.
+    async fn read_line(&mut self) -> io::Result<Option<Result<(), ParseError>>> {
+        self.line.clear();
+        let n = (&mut self.reader)
+            .take(MAX_LINE_BYTES + 1)
+            .read_until(b'\n', &mut self.line)
+            .await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let complete = self.line.last() == Some(&b'\n');
+        if complete || self.line.len() as u64 <= MAX_LINE_BYTES {
+            return Ok(Some(Ok(())));
+        }
+
+        // Too long: throw away the rest of the line in bounded chunks.
+        loop {
+            self.line.clear();
+            let n = (&mut self.reader)
+                .take(MAX_LINE_BYTES)
+                .read_until(b'\n', &mut self.line)
+                .await?;
+            if n == 0 || self.line.last() == Some(&b'\n') {
+                return Ok(Some(Err(ParseError::TooLong)));
+            }
+        }
+    }
+
+    fn skip(&mut self, error: &ParseError) {
+        self.skipped_lines += 1;
+        warn!(line = self.line_number, %error, "skipping replay line");
+    }
 }
 
 impl<R: AsyncBufRead + Unpin + Send> FrameSource for ReplaySource<R> {
     async fn next_frame(&mut self) -> io::Result<Option<Frame>> {
         loop {
-            self.line.clear();
-            if self.reader.read_line(&mut self.line).await? == 0 {
+            let Some(read) = self.read_line().await? else {
+                if self.skipped_lines > 0 {
+                    warn!(
+                        skipped = self.skipped_lines,
+                        "replay finished with skipped lines"
+                    );
+                }
                 return Ok(None);
-            }
+            };
             self.line_number += 1;
-            if self.line.trim().is_empty() {
-                continue;
-            }
 
-            match parse_line(&self.line) {
-                Ok(frame) => {
+            let parsed = read.and_then(|()| {
+                let line = std::str::from_utf8(&self.line).map_err(|_| ParseError::Encoding)?;
+                if line.trim().is_empty() {
+                    Ok(None)
+                } else {
+                    parse_line(line).map(Some)
+                }
+            });
+            match parsed {
+                Ok(None) => {}
+                Ok(Some(frame)) => {
                     if self.realtime {
                         self.wait_for(frame.timestamp).await;
                     }
                     return Ok(Some(frame));
                 }
-                Err(e) => {
-                    self.skipped_lines += 1;
-                    warn!(line = self.line_number, error = %e, "skipping replay line");
-                }
+                Err(error) => self.skip(&error),
             }
         }
     }
@@ -191,11 +264,20 @@ mod tests {
             ("1.0 vcan0 0CF00400#FF", ParseError::Timestamp),
             ("(1) vcan0 0CF00400#FF", ParseError::Timestamp),
             ("(1.x) vcan0 0CF00400#FF", ParseError::Timestamp),
+            ("(+1.0) vcan0 0CF00400#FF", ParseError::Timestamp),
+            ("(1.+5) vcan0 0CF00400#FF", ParseError::Timestamp),
+            (
+                "(18446744073709551615.0) vcan0 0CF00400#FF",
+                ParseError::Timestamp,
+            ),
+            ("(253402300800.0) vcan0 0CF00400#FF", ParseError::Timestamp),
+            ("(1.0) vcan0 +CF00400#FF", ParseError::Id),
             ("(1.0) vcan0 123#FF", ParseError::Id),
             ("(1.0) vcan0 2CF00400#FF", ParseError::Id),
             ("(1.0) vcan0 0CF0040G#FF", ParseError::Id),
             ("(1.0) vcan0 0CF00400#FFF", ParseError::Data),
             ("(1.0) vcan0 0CF00400#ZZ", ParseError::Data),
+            ("(1.0) vcan0 0CF00400#+F", ParseError::Data),
             ("(1.0) vcan0 0CF00400#FFFFFFFFFFFFFFFFFF", ParseError::Data),
             ("(1.0) vcan0 0CF00400##0FF", ParseError::Unsupported),
             ("(1.0) vcan0 0CF00400#R", ParseError::Unsupported),
@@ -217,7 +299,30 @@ garbage
         assert_eq!(source.next_frame().await.unwrap().unwrap().id, 0x18FE_EE00);
         assert_eq!(source.next_frame().await.unwrap().unwrap().id, 0x0CF0_0400);
         assert_eq!(source.next_frame().await.unwrap(), None);
-        assert_eq!(source.skipped_lines, 1);
+        assert_eq!(source.skipped_lines(), 1);
+    }
+
+    #[tokio::test]
+    async fn skips_lines_that_are_not_utf8_or_too_long() {
+        let mut log = b"(1.000000) vcan0 18FEEE00#7D\n".to_vec();
+        log.extend_from_slice(b"\xFF\xFE broken\n");
+        log.extend_from_slice(&[b'A'; 10_000]);
+        log.extend_from_slice(b"\n(2.000000) vcan0 18FEEE00#7E\n");
+        log.extend_from_slice(b"(3.000000) vcan0 18FEEE00#7F");
+
+        let mut source = ReplaySource::new(log.as_slice(), false);
+        let mut data = Vec::new();
+        while let Some(frame) = source.next_frame().await.unwrap() {
+            data.push(frame.data[0]);
+        }
+        assert_eq!(data, [0x7D, 0x7E, 0x7F]);
+        assert_eq!(source.skipped_lines(), 2);
+    }
+
+    #[test]
+    fn accepts_the_last_representable_second() {
+        let frame = parse_line("(253402300799.999999) vcan0 18FEEE00#7D").unwrap();
+        assert!(timestamp_in_range(frame.timestamp));
     }
 
     #[tokio::test(start_paused = true)]

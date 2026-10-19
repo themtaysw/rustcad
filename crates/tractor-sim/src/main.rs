@@ -11,7 +11,7 @@ use anyhow::Result;
 use clap::Parser;
 use rand::{SeedableRng, rngs::StdRng};
 
-use crate::sim::Simulator;
+use crate::sim::{Simulator, ticks};
 use crate::sink::{FrameSink, LogSink};
 
 /// Simulates a tractor working a field and writes its J1939 frames to a CAN interface.
@@ -36,7 +36,7 @@ struct Args {
     garbage_rate: f64,
 
     /// Stop after this many seconds. Runs forever if not set.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_duration)]
     duration_secs: Option<f64>,
 
     /// Seed for the random noise, for reproducible runs.
@@ -59,10 +59,8 @@ fn main() -> Result<()> {
     let mut sink = open_sink(&args)?;
 
     let tick = Duration::from_secs_f64(1.0 / args.rate_hz);
-    let status_every = (args.rate_hz * 5.0).round().max(1.0) as u64;
-    let total_ticks = args
-        .duration_secs
-        .map(|secs| (secs * args.rate_hz).round() as u64);
+    let status_every = ticks(5.0, args.rate_hz);
+    let total_ticks = args.duration_secs.map(|secs| ticks(secs, args.rate_hz));
     let start = Instant::now();
 
     eprintln!("tractor-sim: {args:?}");
@@ -70,7 +68,13 @@ fn main() -> Result<()> {
     let mut n: u64 = 0;
     while total_ticks.is_none_or(|total| n < total) {
         for frame in sim.tick() {
-            sink.send(&frame)?;
+            if let Err(e) = sink.send(&frame) {
+                // `--dry-run | head` closes the pipe early; that is a normal way to stop.
+                if is_broken_pipe(&e) {
+                    return Ok(());
+                }
+                return Err(e);
+            }
         }
         if n.is_multiple_of(status_every) {
             eprintln!("{}", sim.tractor().status());
@@ -103,12 +107,24 @@ fn open_can(_iface: &str) -> Result<Box<dyn FrameSink>> {
     anyhow::bail!("SocketCAN is only available on Linux, use --dry-run to print frames instead")
 }
 
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe)
+}
+
 fn parse_u8(s: &str) -> Result<u8, String> {
-    let parsed = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        Some(hex) => u8::from_str_radix(hex, 16),
-        None => s.parse(),
-    };
-    parsed.map_err(|e| format!("{s:?} is not a byte (0-255 or 0x00-0xFF): {e}"))
+    let invalid = || format!("{s:?} is not a byte (0-255 or 0x00-0xFF)");
+    // `from_str_radix` and `parse` accept a leading `+`, so check the digits first.
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            u8::from_str_radix(hex, 16).map_err(|_| invalid())
+        }
+        None if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => {
+            s.parse().map_err(|_| invalid())
+        }
+        _ => Err(invalid()),
+    }
 }
 
 fn parse_rate(s: &str) -> Result<f64, String> {
@@ -117,6 +133,15 @@ fn parse_rate(s: &str) -> Result<f64, String> {
         return Err(format!("{rate} is not in (0, 1000]"));
     }
     Ok(rate)
+}
+
+fn parse_duration(s: &str) -> Result<f64, String> {
+    let secs: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    // About a year; also rejects NaN, which fails every comparison.
+    if !(secs > 0.0 && secs <= 31_536_000.0) {
+        return Err(format!("{secs} is not in (0, 31536000]"));
+    }
+    Ok(secs)
 }
 
 fn parse_probability(s: &str) -> Result<f64, String> {
@@ -140,6 +165,10 @@ mod tests {
         assert!(parse_u8("0x100").is_err());
         assert!(parse_u8("256").is_err());
         assert!(parse_u8("abc").is_err());
+        assert!(parse_u8("+1").is_err());
+        assert!(parse_u8("0x+F").is_err());
+        assert!(parse_u8("0x").is_err());
+        assert!(parse_u8("").is_err());
     }
 
     #[test]
@@ -151,6 +180,11 @@ mod tests {
         assert_eq!(parse_probability("0.05"), Ok(0.05));
         assert!(parse_probability("1.5").is_err());
         assert!(parse_probability("NaN").is_err());
+        assert_eq!(parse_duration("40"), Ok(40.0));
+        assert!(parse_duration("0").is_err());
+        assert!(parse_duration("-1").is_err());
+        assert!(parse_duration("NaN").is_err());
+        assert!(parse_duration("inf").is_err());
     }
 
     #[test]

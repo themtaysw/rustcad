@@ -8,7 +8,7 @@ use tracing::debug;
 use super::FrameSource;
 use crate::frame::Frame;
 
-/// Live frames from a SocketCAN interface such as `can0` or `vcan0`.
+/// Live frames from a `SocketCAN` interface such as `can0` or `vcan0`.
 pub struct SocketCanSource {
     socket: CanSocket,
 }
