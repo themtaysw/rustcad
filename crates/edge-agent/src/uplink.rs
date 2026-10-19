@@ -80,6 +80,7 @@ enum SendError {
 #[derive(Serialize)]
 struct BatchBody<'a> {
     device_id: &'a str,
+    outbox_id: &'a str,
     batch_id: String,
     dropped_records: u64,
     records: Vec<RecordBody<'a>>,
@@ -221,8 +222,9 @@ impl Uplink {
         let last = batch.records.last().map_or(0, |r| r.seq);
         let body = BatchBody {
             device_id: &self.config.device_id,
-            // Same seq range means same batch, so a retry after a lost response keeps its id
-            // and the receiver does not count `dropped_records` twice.
+            outbox_id: self.outbox.id(),
+            // Same seq range in the same outbox means same batch, so a retry after a lost
+            // response keeps its id and the receiver does not count `dropped_records` twice.
             batch_id: format!("{first}-{last}"),
             dropped_records: batch.dropped_records,
             records: batch

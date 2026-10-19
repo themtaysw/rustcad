@@ -18,6 +18,7 @@ class Record(BaseModel):
 
 class Batch(BaseModel):
     device_id: DeviceId
+    outbox_id: str = Field(min_length=1, max_length=64)
     batch_id: str = Field(min_length=1, max_length=64)
     dropped_records: int = Field(default=0, ge=0)
     records: list[Record] = Field(max_length=MAX_RECORDS_PER_BATCH)

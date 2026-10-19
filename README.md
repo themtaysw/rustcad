@@ -117,8 +117,8 @@ EDGE_RECEIVER_TOKEN=dev-token cargo run -p edge-agent -- \
   deleted, and the agent restarted, numbering continues where it stopped.
 - **At-least-once delivery, deduped by the receiver.** A batch is deleted from the outbox only
   after the receiver answers 2xx. If the answer is lost, the batch is sent again. The receiver
-  stores records with `ON CONFLICT (device_id, seq) DO NOTHING`, so a resend changes nothing.
-  The batch id is the seq range, so a resent batch has the same id.
+  stores records with `ON CONFLICT (device_id, outbox_id, seq) DO NOTHING`, so a resend
+  changes nothing. The batch id is the seq range, so a resent batch has the same id.
 - **Retries never give up.** Network errors, timeouts, 5xx and even 4xx are retried with
   exponential backoff (0.5 s doubling to 60 s) and jitter, so a fleet coming back into coverage
   together does not hit the receiver in lockstep. A 4xx is logged as an error, since it
@@ -220,10 +220,11 @@ a Docker build for the receiver.
   battery and no network at boot, so the clock can be wrong by years. Production would take
   time from GPS (J1939 or NMEA), mark samples recorded before sync, and correct them on the
   receiver.
-- **Fresh outbox, old numbers.** `seq` starts at 1 in every new outbox file. A device that
-  gets a new outbox under the same `device_id` (reinstall, replaced SD card) would have its
-  first records dropped by the receiver as duplicates of old ones. The fix is an `outbox_id`
-  generated with the outbox and part of the dedupe key; see `docs/decisions.md`.
+- **Fresh outbox, old numbers.** `seq` starts at 1 in every new outbox file, so each file
+  gets a random `outbox_id` (UUID v4) when it is created, and the receiver dedupes on
+  `(device_id, outbox_id, seq)`. A reinstalled device or a replaced SD card no longer loses
+  its first records as "duplicates". An existing dev database needs a reset or a manual
+  migration, see `docs/decisions.md`.
 - **Schema migrations.** The receiver creates its tables at startup with `IF NOT EXISTS`.
   A real service would use a migration tool.
 - **Transport.** HTTP batches are simple and easy to debug. MQTT (QoS 1) would push data with

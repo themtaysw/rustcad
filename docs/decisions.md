@@ -100,14 +100,14 @@ aggregation interval.
 formatter. The test therefore also checks that our parser reads what can-utils actually writes.
 It asserts exact counts: 1711 frames, 6 unknown PGNs, 11 with the wrong length.
 
-## receiver: `(device_id, seq)` is the primary key, inserts use `ON CONFLICT DO NOTHING`
+## receiver: `(device_id, outbox_id, seq)` is the primary key, inserts use `ON CONFLICT DO NOTHING`
 Delivery is at-least-once: the agent retries a batch whenever it does not see a 2xx, including
 when the receiver stored it but the response got lost. The key makes a retry harmless. The whole
 batch goes in as one `INSERT ... SELECT FROM unnest(arrays)` statement: one round trip, and
 `rowcount` gives the exact number of new rows. The response reports `inserted` and `duplicates`.
 
 ## receiver: batches are recorded too
-A `batches` table keeps `(device_id, batch_id)` with record count and the agent's
+A `batches` table keeps `(device_id, outbox_id, batch_id)` with record count and the agent's
 `dropped_records` counter, also with `ON CONFLICT DO NOTHING`. A retried batch therefore does not
 count the same drops twice, and there is a record of what each device sent.
 
@@ -215,13 +215,36 @@ aarch64, most of it TLS (rustls with aws-lc) and bundled SQLite. `opt-level = "z
 further at the cost of speed; not needed at this size. With `panic = "abort"` a bug kills the
 process at once and systemd restarts it, which SQLite handles fine.
 
-## known limitation: a new outbox restarts `seq` at 1
-`seq` is unique per outbox file, but the receiver dedupes on `(device_id, seq)`. If a device
-gets a fresh outbox (reinstall, deleted state dir, replaced SD card) under the same
-`device_id`, its first records reuse old numbers and the receiver drops them as duplicates.
-Seen for real in the quickstart test: `inserted=5 duplicates=3` on a device that already had
-seq 1-3. Fix: generate an `outbox_id` (UUID) when the outbox is created, send it with every
-batch and dedupe on `(device_id, outbox_id, seq)`. Not done yet.
+## edge-agent + receiver: every outbox file has its own `outbox_id`
+`seq` is unique only within one outbox file. A device that gets a fresh outbox (reinstall,
+deleted state dir, replaced SD card) under the same `device_id` starts at seq 1 again; with
+the old key `(device_id, seq)` the receiver dropped those records as duplicates (seen in the
+quickstart test: `inserted=5 duplicates=3` on a device that already had seq 1-3).
+
+The outbox now generates a random UUID v4 when the file is created and keeps it in a
+`meta_text` table. A separate table, because `meta.value` is `INTEGER`; older files simply get
+the table and an id on their next open. The id is sent as `outbox_id` with every batch, and
+the receiver's keys are `(device_id, outbox_id, seq)` and `(device_id, outbox_id, batch_id)`.
+A UUID instead of a counter or a boot id: nothing has to be coordinated with the receiver,
+and it changes exactly when the seq numbering restarts. `/devices/{id}/latest` still looks
+at all outboxes of a device and picks the newest `ts`. `outbox_id` is a required field, so an
+older agent without it gets 422 until it is updated.
+
+`schema.sql` only runs `CREATE TABLE IF NOT EXISTS`, so an existing dev database keeps the
+old tables and every ingest fails. Reset it with
+`docker compose -f cloud/docker-compose.yml down -v` (project `rustcad` only, which deletes
+the stored telemetry), or migrate by hand:
+
+```sql
+ALTER TABLE telemetry ADD COLUMN outbox_id text NOT NULL DEFAULT 'legacy';
+ALTER TABLE telemetry ALTER COLUMN outbox_id DROP DEFAULT;
+ALTER TABLE telemetry DROP CONSTRAINT telemetry_pkey, ADD PRIMARY KEY (device_id, outbox_id, seq);
+ALTER TABLE batches ADD COLUMN outbox_id text NOT NULL DEFAULT 'legacy';
+ALTER TABLE batches ALTER COLUMN outbox_id DROP DEFAULT;
+ALTER TABLE batches DROP CONSTRAINT batches_pkey, ADD PRIMARY KEY (device_id, outbox_id, batch_id);
+```
+
+The pytest fixture drops and recreates `telemetry_test` every session for the same reason.
 
 ## ci: GitHub Actions on Linux
 One job runs `cargo fmt --check`, clippy with `-D warnings` and the tests on ubuntu, so the

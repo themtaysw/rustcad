@@ -95,6 +95,22 @@ impl FakeReceiver {
             .collect()
     }
 
+    /// The receiver's dedupe key without device_id, which is the same in every test.
+    fn unique_keys(&self) -> BTreeSet<(String, i64)> {
+        self.batches()
+            .iter()
+            .flat_map(|b| {
+                let outbox_id = b["outbox_id"].as_str().unwrap().to_owned();
+                b["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(move |r| (outbox_id.clone(), r["seq"].as_i64().unwrap()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     fn unique_seqs(&self) -> Vec<i64> {
         self.seqs()
             .into_iter()
@@ -147,6 +163,10 @@ fn split_fixture(lines: usize) -> (&'static str, &'static str) {
     FIXTURE.split_at(at)
 }
 
+fn outbox_id(path: &Path) -> String {
+    Outbox::open(path, 1).unwrap().id().to_owned()
+}
+
 fn range(first: i64, last: i64) -> Vec<i64> {
     (first..=last).collect()
 }
@@ -156,14 +176,8 @@ async fn uploads_every_sample_exactly_once() {
     let dir = TempDir::new().unwrap();
     let (server, receiver) = FakeReceiver::start(|_| Behavior::Ok).await;
 
-    let summary = run_agent(
-        FIXTURE,
-        &dir.path().join("o.db"),
-        10_000,
-        &server,
-        Duration::from_secs(10),
-    )
-    .await;
+    let outbox = dir.path().join("o.db");
+    let summary = run_agent(FIXTURE, &outbox, 10_000, &server, Duration::from_secs(10)).await;
 
     assert_eq!(summary.frames_read, 1711);
     assert_eq!(
@@ -189,6 +203,7 @@ async fn uploads_every_sample_exactly_once() {
         let (first, last) = (&records[0]["seq"], &records[records.len() - 1]["seq"]);
         assert_eq!(batch["batch_id"], format!("{first}-{last}"));
         assert_eq!(batch["device_id"], DEVICE);
+        assert_eq!(batch["outbox_id"], outbox_id(&outbox));
         assert_eq!(batch["dropped_records"], 0);
     }
 
@@ -300,6 +315,49 @@ async fn restart_continues_seq_without_gaps_or_reuse() {
     let run3 = run_agent("", &outbox, 10_000, &server, Duration::from_secs(10)).await;
     assert_eq!(run3.outbox_depth, 0);
     assert_eq!(after.seqs(), range(n1 + 1, n1 + n2));
+}
+
+#[tokio::test]
+async fn fresh_outbox_after_deleted_file_is_not_deduped_away() {
+    let dir = TempDir::new().unwrap();
+    let outbox = dir.path().join("o.db");
+    let (first_half, second_half) = split_fixture(850);
+    let (server, receiver) = FakeReceiver::start(|_| Behavior::Ok).await;
+
+    let run1 = run_agent(
+        first_half,
+        &outbox,
+        10_000,
+        &server,
+        Duration::from_secs(10),
+    )
+    .await;
+    let first_id = outbox_id(&outbox);
+    for suffix in ["", "-wal", "-shm"] {
+        let file = dir.path().join(format!("o.db{suffix}"));
+        if file.exists() {
+            std::fs::remove_file(file).unwrap();
+        }
+    }
+
+    let run2 = run_agent(
+        second_half,
+        &outbox,
+        10_000,
+        &server,
+        Duration::from_secs(10),
+    )
+    .await;
+    let second_id = outbox_id(&outbox);
+    assert_ne!(first_id, second_id);
+
+    let (n1, n2) = (run1.samples_written as i64, run2.samples_written as i64);
+    let seqs = receiver.seqs();
+    assert_eq!(seqs[..n1 as usize], range(1, n1));
+    assert_eq!(seqs[n1 as usize..], range(1, n2));
+    // Deduped on seq alone, the second run would collide with the first one.
+    assert!(receiver.unique_seqs().len() < (n1 + n2) as usize);
+    assert_eq!(receiver.unique_keys().len(), (n1 + n2) as usize);
 }
 
 #[tokio::test]

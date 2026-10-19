@@ -16,16 +16,21 @@ from receiver.models import Batch, DeviceId, IngestResult, Latest, LatestValue
 logger = logging.getLogger("receiver")
 
 INSERT_TELEMETRY = """
-INSERT INTO telemetry (device_id, seq, ts, signal, value)
-SELECT %(device_id)s::text, *
+INSERT INTO telemetry (device_id, outbox_id, seq, ts, signal, value)
+SELECT %(device_id)s::text, %(outbox_id)s::text, *
 FROM unnest(%(seq)s::bigint[], %(ts)s::timestamptz[], %(signal)s::text[], %(value)s::float8[])
-ON CONFLICT (device_id, seq) DO NOTHING
+ON CONFLICT (device_id, outbox_id, seq) DO NOTHING
 """
 
 INSERT_BATCH = """
-INSERT INTO batches (device_id, batch_id, record_count, inserted_count, dropped_records)
-VALUES (%(device_id)s, %(batch_id)s, %(record_count)s, %(inserted_count)s, %(dropped_records)s)
-ON CONFLICT (device_id, batch_id) DO NOTHING
+INSERT INTO batches (
+    device_id, outbox_id, batch_id, record_count, inserted_count, dropped_records
+)
+VALUES (
+    %(device_id)s, %(outbox_id)s, %(batch_id)s,
+    %(record_count)s, %(inserted_count)s, %(dropped_records)s
+)
+ON CONFLICT (device_id, outbox_id, batch_id) DO NOTHING
 """
 
 SELECT_LATEST = """
@@ -92,6 +97,7 @@ def create_app(database_url: str | None = None, token: str | None = None) -> Fas
                 INSERT_TELEMETRY,
                 {
                     "device_id": batch.device_id,
+                    "outbox_id": batch.outbox_id,
                     "seq": [r.seq for r in records],
                     "ts": [r.ts for r in records],
                     "signal": [r.signal for r in records],
@@ -102,6 +108,7 @@ def create_app(database_url: str | None = None, token: str | None = None) -> Fas
                 INSERT_BATCH,
                 {
                     "device_id": batch.device_id,
+                    "outbox_id": batch.outbox_id,
                     "batch_id": batch.batch_id,
                     "record_count": len(records),
                     "inserted_count": inserted,

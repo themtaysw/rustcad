@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, params};
 use thiserror::Error;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::aggregate::Sample;
 
@@ -31,6 +32,10 @@ CREATE TABLE IF NOT EXISTS meta (
     value INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO meta (key, value) VALUES ('dropped_records', 0);
+CREATE TABLE IF NOT EXISTS meta_text (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +58,7 @@ pub struct Batch {
 /// Uploaded records are deleted, so every row in `records` is unsent.
 pub struct Outbox {
     conn: Connection,
+    id: String,
     cap: u64,
     depth: u64,
 }
@@ -66,12 +72,29 @@ impl Outbox {
         // that was acknowledged must survive that.
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.execute_batch(SCHEMA)?;
+        // Generated once per file and kept forever. `seq` starts at 1 in every new file,
+        // so the receiver dedupes on (device_id, outbox_id, seq).
+        conn.execute(
+            "INSERT OR IGNORE INTO meta_text (key, value) VALUES ('outbox_id', ?1)",
+            [Uuid::new_v4().to_string()],
+        )?;
+        let id: String = conn.query_row(
+            "SELECT value FROM meta_text WHERE key = 'outbox_id'",
+            [],
+            |row| row.get(0),
+        )?;
         let depth: i64 = conn.query_row("SELECT count(*) FROM records", [], |row| row.get(0))?;
         Ok(Self {
             conn,
+            id,
             cap: cap.max(1),
             depth: depth as u64,
         })
+    }
+
+    /// Random id of this outbox file, created with it.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     /// Number of unsent records.
@@ -181,13 +204,20 @@ fn from_unix_millis(millis: i64) -> SystemTime {
 #[derive(Clone)]
 pub struct OutboxHandle {
     inner: Arc<Mutex<Outbox>>,
+    id: Arc<str>,
 }
 
 impl OutboxHandle {
     pub fn new(outbox: Outbox) -> Self {
         Self {
+            id: outbox.id().into(),
             inner: Arc::new(Mutex::new(outbox)),
         }
+    }
+
+    /// The id never changes, so it is copied out and needs no lock.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     async fn with<T, F>(&self, f: F) -> T
@@ -286,6 +316,43 @@ mod tests {
     }
 
     #[test]
+    fn id_survives_restart_and_differs_between_files() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("o.db");
+        let id = Outbox::open(&path, 100).unwrap().id().to_owned();
+        assert_eq!(Uuid::parse_str(&id).unwrap().get_version_num(), 4);
+        assert_eq!(Outbox::open(&path, 100).unwrap().id(), id);
+
+        let other = Outbox::open(dir.path().join("other.db"), 100).unwrap();
+        assert_ne!(other.id(), id);
+    }
+
+    #[test]
+    fn opens_an_outbox_created_before_outbox_id() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("o.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE records (
+                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                     ts_ms INTEGER NOT NULL, signal TEXT NOT NULL, value REAL NOT NULL
+                 );
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+                 INSERT INTO meta VALUES ('dropped_records', 4);
+                 INSERT INTO records (ts_ms, signal, value) VALUES (0, 'coolant_temp_c', 1.0);",
+            )
+            .unwrap();
+
+        let outbox = Outbox::open(&path, 100).unwrap();
+        assert_eq!(outbox.depth(), 1);
+        assert_eq!(outbox.dropped_records().unwrap(), 4);
+        let id = outbox.id().to_owned();
+        drop(outbox);
+        assert_eq!(Outbox::open(&path, 100).unwrap().id(), id);
+    }
+
+    #[test]
     fn depth_survives_restart() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("o.db");
@@ -328,8 +395,11 @@ mod tests {
     #[tokio::test]
     async fn handle_runs_calls_on_the_blocking_pool() {
         let dir = TempDir::new().unwrap();
-        let handle = OutboxHandle::new(Outbox::open(dir.path().join("o.db"), 100).unwrap());
+        let outbox = Outbox::open(dir.path().join("o.db"), 100).unwrap();
+        let id = outbox.id().to_owned();
+        let handle = OutboxHandle::new(outbox);
         let writer = handle.clone();
+        assert_eq!(writer.id(), id);
         assert_eq!(writer.append(samples(4)).await.unwrap(), 4);
         let batch = handle.next_batch(10).await.unwrap();
         handle.ack(batch.records[1].seq, 0).await.unwrap();

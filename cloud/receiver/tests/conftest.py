@@ -16,14 +16,16 @@ TOKEN = "test-token"
 
 @pytest.fixture(scope="session")
 def database_url() -> str:
-    """A separate database on the same server, so tests never touch dev data."""
+    """A separate database on the same server, so tests never touch dev data.
+
+    Recreated every session: schema.sql only creates missing tables, so an old test
+    database would keep an outdated schema.
+    """
+    db = sql.Identifier(TEST_DB)
     try:
         with psycopg.connect(ADMIN_URL, autocommit=True, connect_timeout=3) as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM pg_database WHERE datname = %s", (TEST_DB,)
-            ).fetchone()
-            if not exists:
-                conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(TEST_DB)))
+            conn.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(db))
+            conn.execute(sql.SQL("CREATE DATABASE {}").format(db))
     except psycopg.OperationalError as e:
         pytest.fail(
             f"cannot reach Postgres at {ADMIN_URL} ({e}). "

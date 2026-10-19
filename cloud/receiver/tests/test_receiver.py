@@ -5,8 +5,14 @@ def record(seq, signal="engine_speed_rpm", value=1500.0, ts="2026-10-18T10:00:00
     return {"seq": seq, "ts": ts, "signal": signal, "value": value}
 
 
-def batch(*records, batch_id="b1", device_id="tractor-1", **extra):
-    return {"device_id": device_id, "batch_id": batch_id, "records": list(records), **extra}
+def batch(*records, batch_id="b1", device_id="tractor-1", outbox_id="outbox-a", **extra):
+    return {
+        "device_id": device_id,
+        "outbox_id": outbox_id,
+        "batch_id": batch_id,
+        "records": list(records),
+        **extra,
+    }
 
 
 def count(db, device_id="tractor-1"):
@@ -57,6 +63,35 @@ def test_seq_is_per_device(client, db):
     assert count(db, "tractor-2") == 1
 
 
+def test_seq_is_per_outbox(client, db):
+    # A device that got a fresh outbox starts at seq 1 again; those records are new.
+    old = client.post("/ingest", json=batch(record(1), record(2), outbox_id="outbox-a"))
+    new = client.post("/ingest", json=batch(record(1), record(2), outbox_id="outbox-b"))
+    assert old.json() == {"accepted": 2, "inserted": 2, "duplicates": 0}
+    assert new.json() == {"accepted": 2, "inserted": 2, "duplicates": 0}
+    assert count(db) == 4
+
+    rows = db.execute("SELECT outbox_id, batch_id FROM batches ORDER BY outbox_id").fetchall()
+    assert rows == [("outbox-a", "b1"), ("outbox-b", "b1")]
+
+
+def test_latest_spans_outboxes(client):
+    client.post(
+        "/ingest",
+        json=batch(record(5, value=800.0, ts="2026-10-18T10:00:00Z"), outbox_id="outbox-a"),
+    )
+    client.post(
+        "/ingest",
+        json=batch(record(1, value=1900.0, ts="2026-10-18T11:00:00Z"), outbox_id="outbox-b"),
+    )
+    body = client.get("/devices/tractor-1/latest").json()
+    assert body["signals"]["engine_speed_rpm"] == {
+        "value": 1900.0,
+        "ts": "2026-10-18T11:00:00Z",
+        "seq": 1,
+    }
+
+
 def test_duplicate_seq_inside_one_batch(client, db):
     response = client.post("/ingest", json=batch(record(7), record(7)))
     assert response.json() == {"accepted": 2, "inserted": 1, "duplicates": 1}
@@ -85,7 +120,10 @@ def test_empty_batch_is_accepted(client):
         batch(record(1), device_id=""),
         batch(record(1), device_id="a/b"),
         batch(record(1), batch_id=""),
-        {"device_id": "tractor-1", "records": [record(1)]},
+        batch(record(1), outbox_id=""),
+        batch(record(1), outbox_id="x" * 65),
+        {"device_id": "tractor-1", "outbox_id": "o", "records": [record(1)]},
+        {"device_id": "tractor-1", "batch_id": "b", "records": [record(1)]},
     ],
 )
 def test_rejects_invalid_batches(client, db, bad):
@@ -96,7 +134,7 @@ def test_rejects_invalid_batches(client, db, bad):
 def test_rejects_non_finite_values(client, db):
     # json= refuses to encode NaN, so the body is written by hand. Python's json accepts it.
     body = (
-        '{"device_id": "t", "batch_id": "b", "records": '
+        '{"device_id": "t", "outbox_id": "o", "batch_id": "b", "records": '
         '[{"seq": 1, "ts": "2026-10-18T10:00:00Z", "signal": "x", "value": NaN}]}'
     )
     response = client.post("/ingest", content=body, headers={"Content-Type": "application/json"})
